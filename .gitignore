@@ -1,0 +1,20 @@
+# Local project handoff notes
+GET_STARTED.md
+
+# JavaScript dependencies
+node_modules/
+
+# Rust and Tauri build output
+target/
+src-tauri/target/
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.DS_Store
+*.log
+.idea/
+.vscode/
+*.swp
+*.swo
