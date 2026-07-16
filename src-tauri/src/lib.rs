@@ -1,4 +1,5 @@
 pub mod native_audio;
+mod native_bridge;
 pub mod native_playback;
 mod navigation;
 mod server_profile;
@@ -94,6 +95,7 @@ async fn connect_to_server(
 ) -> Result<ServerProfile, String> {
     let previous = state.profile();
     let profile = state.validate_and_store(&origin).await?;
+    native_bridge::authorize_origin(&app, &profile.origin)?;
     if previous.is_some_and(|previous| previous.origin != profile.origin) {
         playback
             .dispose_active(native_playback::TerminationReason::ServerSwitched)
@@ -171,34 +173,6 @@ pub fn run() {
     native_playback::configure_bundled_vulkan_loader();
 
     let builder = tauri::Builder::default()
-        .register_asynchronous_uri_scheme_protocol(
-            native_playback::BRIDGE_SCHEME,
-            |context, request, responder| {
-                let app = context.app_handle().clone();
-                let webview_label = context.webview_label().to_string();
-                std::thread::spawn(move || {
-                    responder.respond(native_playback::handle_protocol(
-                        &app,
-                        &webview_label,
-                        request,
-                    ));
-                });
-            },
-        )
-        .register_asynchronous_uri_scheme_protocol(
-            native_audio::AUDIO_BRIDGE_SCHEME,
-            |context, request, responder| {
-                let app = context.app_handle().clone();
-                let webview_label = context.webview_label().to_string();
-                std::thread::spawn(move || {
-                    responder.respond(native_audio::handle_audio_protocol(
-                        &app,
-                        &webview_label,
-                        request,
-                    ));
-                });
-            },
-        )
         .plugin(
             tauri_plugin_opener::Builder::new()
                 .open_js_links_on_click(false)
@@ -206,6 +180,7 @@ pub fn run() {
         )
         .plugin(native_playback::lifecycle_plugin())
         .plugin(native_audio::audio_lifecycle_plugin())
+        .plugin(native_bridge::plugin())
         .invoke_handler(tauri::generate_handler![
             get_server_profile,
             get_app_settings,
@@ -268,6 +243,11 @@ pub fn run() {
             let state = AppState::new(config_dir)
                 .map_err(|error| std::io::Error::other(format!("Heya setup failed: {error}")))?;
             app.manage(state.clone());
+            app.manage(native_bridge::NativeBridgeAcl::default());
+            if let Some(profile) = state.profile() {
+                native_bridge::authorize_origin(app.handle(), &profile.origin)
+                    .map_err(std::io::Error::other)?;
+            }
 
             #[cfg(all(
                 feature = "native-mpv",

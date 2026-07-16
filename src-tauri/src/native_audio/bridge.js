@@ -2,7 +2,7 @@
   'use strict'
 
   const protocolVersion = 1
-  const endpointBase = '__HEYA_AUDIO_ENDPOINT__'
+  const commandName = '__HEYA_NATIVE_AUDIO_COMMAND__'
   const readyEventName = 'heya:native-audio:ready-v1'
   const stateEventName = 'heya:native-audio:state-v1'
   const visualizerEventName = 'heya:native-audio:visualizer-v1'
@@ -11,25 +11,23 @@
   const visualizerListeners = new Set()
   let pageActive = true
 
-  async function request(operation, payload, keepalive = false) {
+  async function request(operation, payload, _keepalive = false) {
     if (!pageActive && operation !== 'owner-disappeared') {
       const error = new Error('The owning Heya page is no longer active.')
       error.code = 'unknown_session'
       throw error
     }
 
-    const response = await fetch(`${endpointBase}/v1/${operation}`, {
-      method: 'POST',
-      body: JSON.stringify({ protocolVersion, pageInstanceId, payload }),
-      cache: 'no-store',
-      credentials: 'omit',
-      keepalive,
-      redirect: 'error',
-      referrerPolicy: 'no-referrer',
-      headers: { 'Content-Type': 'text/plain;charset=UTF-8' },
+    const invoke = window.__TAURI_INTERNALS__?.invoke
+    if (typeof invoke !== 'function') {
+      const error = new Error('The native audio transport is unavailable.')
+      error.code = 'backend_unavailable'
+      throw error
+    }
+    const result = await invoke(commandName, {
+      request: { protocolVersion, pageInstanceId, operation, payload },
     })
-    const result = await response.json()
-    if (!response.ok || !result?.ok) {
+    if (!result?.ok) {
       const error = new Error(result?.error?.message || 'Native audio request failed.')
       error.code = result?.error?.code || 'internal_error'
       throw error

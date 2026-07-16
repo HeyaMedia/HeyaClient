@@ -1,8 +1,9 @@
 //! Native playback service and its narrow, versioned WebView boundary.
 //!
 //! Raw renderer operations remain inside Rust. The selected Heya origin gets a
-//! semantic playback object backed by a custom protocol; it has no Tauri
-//! capability and this service never invokes through Tauri's generic IPC.
+//! semantic playback object backed by two origin-scoped Tauri commands. The
+//! page receives no generic application API, and every operation is validated
+//! again against the current saved server origin before dispatch.
 
 mod bridge;
 mod engine;

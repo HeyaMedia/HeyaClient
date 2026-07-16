@@ -304,6 +304,10 @@ mod tests {
         assert!(script.contains("})();\n(() => {"));
         assert!(script.contains("__HEYA_NATIVE_PLAYBACK__"));
         assert!(script.contains("__HEYA_NATIVE_AUDIO__"));
+        assert!(script.contains("plugin:native-bridge|native_audio_request"));
+        assert!(script.contains("plugin:native-bridge|native_playback_request"));
+        assert!(!script.contains("heya-native-audio://"));
+        assert!(!script.contains("heya-native-playback://"));
     }
 
     #[test]

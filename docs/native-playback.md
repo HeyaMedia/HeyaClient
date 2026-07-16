@@ -41,21 +41,23 @@ capabilities and reject new native loads with `backend_unavailable`; an
 existing playback session is allowed to finish. The selected remote Heya
 origin cannot read or change this local preference through generic Tauri IPC.
 
-Transport uses a private custom WebView protocol, not Tauri `invoke`. Every
-operation rechecks the WebView label, live main-frame URL, HTTP `Origin`, and
-saved Heya origin. Media URLs must use HTTP(S), match that origin, contain no
+Transport uses one narrowly permissioned Tauri command. Its remote capability
+is generated for the exact saved origin and the main window only. Every
+operation then rechecks the WebView label, live main-frame URL, and saved Heya
+origin in Rust. Media URLs must use HTTP(S), match that origin, contain no
 credentials or fragment, and live below `/api/playback/native/media/`.
 
 ### Tauri framework boundary
 
 Tauri 2.11 injects its non-configurable `window.__TAURI_INTERNALS__` bootstrap
 into every Tauri-managed WebView. There is currently no supported per-WebView
-switch to suppress it. The remote origin is absent from all Tauri capability
-URLs, so generic invocations are denied, and the playback bridge does not use
-that object. HeyaClient accepts this as part of Tauri's framework runtime: the
-object may be visible, but it grants the remote Heya page no native commands.
-All application-specific native playback operations continue to use the
-separately validated bridge described above.
+switch to suppress it. The selected remote origin receives only the two
+semantic Heya bridge permissions (native audio and native playback); generic
+Tauri commands remain denied. The frozen public bridge objects use the
+framework bootstrap internally, but they do not expose raw `invoke`, arbitrary
+command names, or arbitrary native payloads. HeyaClient accepts the visible
+internals object as part of Tauri's framework runtime and retains independent
+origin and schema validation in Rust.
 
 ## Renderer manager
 

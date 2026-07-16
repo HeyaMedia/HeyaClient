@@ -10,10 +10,11 @@ Heya bearer token.
 
 The selected saved Heya origin receives the frozen
 `window.__HEYA_NATIVE_AUDIO__` protocol-v1 object. Every operation validates
-the live main-frame origin again. Transport uses the private
-`heya-native-audio` WebView scheme. The ready event is
-`heya:native-audio:ready-v1`; normalized state and visualizer snapshots are
-delivered through the bridge's subscription methods.
+the live main-frame origin again. Transport uses one narrowly permissioned
+Tauri command whose remote capability is generated for that exact origin and
+the main window only. It does not expose arbitrary Tauri commands. The ready
+event is `heya:native-audio:ready-v1`; normalized state and visualizer
+snapshots are delivered through the bridge's subscription methods.
 
 The exact public shape is documented in
 [`native-audio-bridge.d.ts`](native-audio-bridge.d.ts). Production loads accept

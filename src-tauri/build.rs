@@ -15,5 +15,10 @@ fn main() {
         }
     }
 
-    tauri_build::build()
+    let attributes = tauri_build::Attributes::new().plugin(
+        "native-bridge",
+        tauri_build::InlinedPlugin::new()
+            .commands(&["native_audio_request", "native_playback_request"]),
+    );
+    tauri_build::try_build(attributes).expect("failed to build HeyaClient's Tauri context")
 }

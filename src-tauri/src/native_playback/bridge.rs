@@ -1,39 +1,29 @@
 use super::validation::validate_load;
 use super::{
     BridgeError, BridgeErrorCode, BridgeResponse, DisposePlaybackRequest, EngineMedia,
-    NativeDiagnosticsEvent, NativePlaybackManager, NativeStateEvent, PageInstanceId,
-    PlaybackCapabilities, PlaybackCommandRequest, PlaybackEventSink, PlaybackLoadRequest,
-    PlaybackLoadResult, PlaybackOwner, TerminationReason, WebPlaybackOwner,
-    NATIVE_PLAYBACK_PROTOCOL_VERSION,
+    NativeDiagnosticsEvent, NativePlaybackManager, NativeStateEvent, PlaybackCapabilities,
+    PlaybackCommandRequest, PlaybackEventSink, PlaybackLoadRequest, PlaybackLoadResult,
+    PlaybackOwner, TerminationReason, WebPlaybackOwner, NATIVE_PLAYBACK_PROTOCOL_VERSION,
 };
 use crate::{
     navigation,
     server_profile::{normalize_origin, same_origin, AppState},
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
 #[cfg(debug_assertions)]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{borrow::Cow, sync::Arc};
-use tauri::{
-    http::{header, Method, Request, Response, StatusCode},
-    AppHandle, Manager, RunEvent, Runtime, Url,
-};
+use std::sync::Arc;
+use tauri::{AppHandle, Manager, RunEvent, Runtime, Url, WebviewWindow};
 
-pub const BRIDGE_SCHEME: &str = "heya-native-playback";
 pub const BRIDGE_OBJECT_NAME: &str = "__HEYA_NATIVE_PLAYBACK__";
 pub const BRIDGE_READY_EVENT: &str = "heya:native-playback:ready-v1";
 pub const BRIDGE_STATE_EVENT: &str = "heya:native-playback:state-v1";
 pub const BRIDGE_DIAGNOSTICS_EVENT: &str = "heya:native-playback:diagnostics-v1";
-const MAX_REQUEST_BYTES: usize = 64 * 1024;
-
-#[cfg(any(target_os = "windows", target_os = "android"))]
-const BRIDGE_ENDPOINT: &str = "https://heya-native-playback.localhost";
-#[cfg(not(any(target_os = "windows", target_os = "android")))]
-const BRIDGE_ENDPOINT: &str = "heya-native-playback://localhost";
-
 pub fn initialization_script() -> String {
-    include_str!("bridge.js").replace("__HEYA_PLAYBACK_ENDPOINT__", BRIDGE_ENDPOINT)
+    include_str!("bridge.js").replace(
+        "__HEYA_NATIVE_PLAYBACK_COMMAND__",
+        crate::native_bridge::PLAYBACK_COMMAND,
+    )
 }
 
 pub fn lifecycle_plugin<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
@@ -79,92 +69,50 @@ pub fn lifecycle_plugin<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
         .build()
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WireRequest {
-    protocol_version: u16,
-    page_instance_id: PageInstanceId,
-    payload: Value,
-}
-
-pub fn handle_protocol<R: Runtime>(
+pub(crate) fn handle_playback_ipc<R: Runtime>(
     app: &AppHandle<R>,
-    webview_label: &str,
-    request: Request<Vec<u8>>,
-) -> Response<Cow<'static, [u8]>> {
-    let authorization = authorize_request(app, webview_label, &request);
-    let origin = match authorization {
+    webview: &WebviewWindow<R>,
+    request: crate::native_bridge::NativeBridgeRequest,
+) -> BridgeResponse<Value> {
+    let origin = match authorize_webview(app, webview) {
         Ok(origin) => origin,
-        Err(error) => {
-            return json_response(
-                StatusCode::FORBIDDEN,
-                None,
-                BridgeResponse::<Value>::failure(error),
-            )
-        }
+        Err(error) => return BridgeResponse::failure(error),
     };
-
-    if request.method() != Method::POST {
-        return json_response(
-            StatusCode::METHOD_NOT_ALLOWED,
-            Some(&origin),
-            BridgeResponse::<Value>::failure(BridgeError::invalid_request(
-                "native playback requests must use POST",
-            )),
-        );
+    if let Err(error) = request.ensure_size("playback") {
+        return BridgeResponse::failure(error);
     }
-    if request.body().len() > MAX_REQUEST_BYTES {
-        return json_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Some(&origin),
-            BridgeResponse::<Value>::failure(BridgeError::invalid_request(
-                "native playback request is too large",
-            )),
-        );
-    }
-
-    let wire = match serde_json::from_slice::<WireRequest>(request.body()) {
-        Ok(wire) => wire,
-        Err(_) => {
-            return json_response(
-                StatusCode::BAD_REQUEST,
-                Some(&origin),
-                BridgeResponse::<Value>::failure(BridgeError::invalid_request(
-                    "native playback request is malformed",
-                )),
-            )
-        }
-    };
-    if wire.protocol_version != NATIVE_PLAYBACK_PROTOCOL_VERSION {
-        return json_response(
-            StatusCode::OK,
-            Some(&origin),
-            BridgeResponse::<Value>::failure(BridgeError::new(
-                BridgeErrorCode::ProtocolMismatch,
-                "native playback protocol version is unsupported",
-            )),
-        );
+    if request.protocol_version != NATIVE_PLAYBACK_PROTOCOL_VERSION {
+        return BridgeResponse::failure(BridgeError::new(
+            BridgeErrorCode::ProtocolMismatch,
+            "native playback protocol version is unsupported",
+        ));
     }
 
     let owner = WebPlaybackOwner {
         origin: origin.clone(),
-        page_instance_id: wire.page_instance_id,
+        page_instance_id: request.page_instance_id,
     };
-    if request.uri().path() == "/v1/capabilities" {
+    let path = operation_path(&request.operation);
+    if path == Some("/v1/capabilities") {
         log::info!("native playback bridge activated for {origin}");
     }
-    let result = dispatch(app, request.uri().path(), owner, wire.payload);
+    let result = path
+        .ok_or_else(|| BridgeError::invalid_request("native playback operation is unsupported"))
+        .and_then(|path| dispatch(app, path, owner, request.payload));
     match result {
-        Ok(value) => json_response(
-            StatusCode::OK,
-            Some(&origin),
-            BridgeResponse::success(value),
-        ),
-        Err(error) => json_response(
-            StatusCode::OK,
-            Some(&origin),
-            BridgeResponse::<Value>::failure(error),
-        ),
+        Ok(value) => BridgeResponse::success(value),
+        Err(error) => BridgeResponse::failure(error),
+    }
+}
+
+fn operation_path(operation: &str) -> Option<&'static str> {
+    match operation {
+        "capabilities" => Some("/v1/capabilities"),
+        "load" => Some("/v1/load"),
+        "command" => Some("/v1/command"),
+        "dispose" => Some("/v1/dispose"),
+        "owner-disappeared" => Some("/v1/owner-disappeared"),
+        _ => None,
     }
 }
 
@@ -247,51 +195,46 @@ fn encode(value: impl serde::Serialize) -> Result<Value, BridgeError> {
     })
 }
 
-fn authorize_request<R: Runtime>(
+fn authorize_webview<R: Runtime>(
     app: &AppHandle<R>,
-    webview_label: &str,
-    request: &Request<Vec<u8>>,
+    webview: &WebviewWindow<R>,
 ) -> Result<String, BridgeError> {
-    if webview_label != navigation::MAIN_WINDOW_LABEL {
-        return Err(origin_not_allowed());
-    }
-    let window = app
-        .get_webview_window(navigation::MAIN_WINDOW_LABEL)
-        .ok_or_else(origin_not_allowed)?;
-    let window_url = window.url().map_err(|_| origin_not_allowed())?;
+    let window_url = webview.url().map_err(|_| origin_not_allowed())?;
     let profile = app
         .state::<AppState>()
         .profile()
         .ok_or_else(origin_not_allowed)?;
-    let request_origin = request
-        .headers()
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(origin_not_allowed)?;
-
-    validate_origin(
-        navigation::MAIN_WINDOW_LABEL,
-        &profile.origin,
-        &window_url,
-        request_origin,
-    )
+    validate_window_origin(webview.label(), &profile.origin, &window_url)
 }
 
-fn validate_origin(
+fn validate_window_origin(
     webview_label: &str,
     selected_origin: &str,
     window_url: &Url,
-    request_origin: &str,
 ) -> Result<String, BridgeError> {
     if webview_label != navigation::MAIN_WINDOW_LABEL {
         return Err(origin_not_allowed());
     }
     let selected = normalize_origin(selected_origin).map_err(|_| origin_not_allowed())?;
-    let request_origin = normalize_origin(request_origin).map_err(|_| origin_not_allowed())?;
-    if !same_origin(&selected, window_url) || !same_origin(&selected, &request_origin) {
+    if !same_origin(&selected, window_url) {
         return Err(origin_not_allowed());
     }
     Ok(selected.as_str().trim_end_matches('/').to_string())
+}
+
+fn validate_owner_origin(
+    webview_label: &str,
+    selected_origin: &str,
+    window_url: &Url,
+    owner_origin: &str,
+) -> Result<String, BridgeError> {
+    let selected = validate_window_origin(webview_label, selected_origin, window_url)?;
+    let owner = normalize_origin(owner_origin).map_err(|_| origin_not_allowed())?;
+    let selected_url = normalize_origin(&selected).map_err(|_| origin_not_allowed())?;
+    if !same_origin(&selected_url, &owner) {
+        return Err(origin_not_allowed());
+    }
+    Ok(selected)
 }
 
 fn origin_not_allowed() -> BridgeError {
@@ -299,28 +242,6 @@ fn origin_not_allowed() -> BridgeError {
         BridgeErrorCode::OriginNotAllowed,
         "native playback is not available to this page",
     )
-}
-
-fn json_response<T: serde::Serialize>(
-    status: StatusCode,
-    origin: Option<&str>,
-    body: BridgeResponse<T>,
-) -> Response<Cow<'static, [u8]>> {
-    let bytes = serde_json::to_vec(&body).unwrap_or_else(|_| {
-        br#"{"ok":false,"error":{"code":"internal_error","message":"native playback response failed"}}"#.to_vec()
-    });
-    let mut builder = Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "application/json; charset=utf-8")
-        .header(header::CACHE_CONTROL, "no-store")
-        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .header(header::VARY, "Origin");
-    if let Some(origin) = origin {
-        builder = builder.header(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin);
-    }
-    builder
-        .body(Cow::Owned(bytes))
-        .expect("the native playback response headers are valid")
 }
 
 pub struct TauriPlaybackEventSink<R: Runtime> {
@@ -357,7 +278,7 @@ impl<R: Runtime> TauriPlaybackEventSink<R> {
         let Ok(window_url) = window.url() else {
             return;
         };
-        if validate_origin(
+        if validate_owner_origin(
             navigation::MAIN_WINDOW_LABEL,
             &profile.origin,
             &window_url,
@@ -437,51 +358,63 @@ impl<R: Runtime> PlaybackEventSink for TauriPlaybackEventSink<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_playback_preference, validate_origin};
+    use super::{
+        apply_playback_preference, operation_path, validate_owner_origin, validate_window_origin,
+    };
     use crate::native_playback::{BridgeErrorCode, NativeVideoSurface, PlaybackCapabilities};
     use tauri::Url;
 
     #[test]
     fn validates_selected_origin_for_window_and_request_on_every_operation() {
         assert_eq!(
-            validate_origin(
+            validate_window_origin(
                 "main",
                 "https://heya.example.com",
                 &Url::parse("https://heya.example.com/movies/42").unwrap(),
-                "https://heya.example.com",
             )
             .unwrap(),
             "https://heya.example.com"
         );
 
-        for (window, request_origin) in [
-            ("https://evil.example/movies/42", "https://heya.example.com"),
-            ("https://heya.example.com/movies/42", "https://evil.example"),
-            ("https://heya.example.com/movies/42", "null"),
-        ] {
-            assert_eq!(
-                validate_origin(
-                    "main",
-                    "https://heya.example.com",
-                    &Url::parse(window).unwrap(),
-                    request_origin,
-                )
-                .unwrap_err()
-                .code,
-                BridgeErrorCode::OriginNotAllowed
-            );
-        }
         assert_eq!(
-            validate_origin(
-                "settings",
+            validate_window_origin(
+                "main",
                 "https://heya.example.com",
-                &Url::parse("https://heya.example.com/").unwrap(),
-                "https://heya.example.com",
+                &Url::parse("https://evil.example/movies/42").unwrap(),
             )
             .unwrap_err()
             .code,
             BridgeErrorCode::OriginNotAllowed
         );
+        assert_eq!(
+            validate_window_origin(
+                "settings",
+                "https://heya.example.com",
+                &Url::parse("https://heya.example.com/").unwrap(),
+            )
+            .unwrap_err()
+            .code,
+            BridgeErrorCode::OriginNotAllowed
+        );
+        assert_eq!(
+            validate_owner_origin(
+                "main",
+                "https://heya.example.com",
+                &Url::parse("https://heya.example.com/movies/42").unwrap(),
+                "https://evil.example",
+            )
+            .unwrap_err()
+            .code,
+            BridgeErrorCode::OriginNotAllowed
+        );
+    }
+
+    #[test]
+    fn maps_only_the_public_playback_operations() {
+        assert_eq!(operation_path("capabilities"), Some("/v1/capabilities"));
+        assert_eq!(operation_path("command"), Some("/v1/command"));
+        assert_eq!(operation_path("shell"), None);
+        assert_eq!(operation_path("/v1/command"), None);
     }
 
     #[test]
