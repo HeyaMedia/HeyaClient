@@ -47,10 +47,14 @@ typedef void (*mpv_render_update_fn)(void *callback_context);
 typedef struct heya_mpv_api {
   unsigned long (*client_api_version)(void);
   mpv_handle *(*create)(void);
+  mpv_handle *(*create_client)(mpv_handle *, const char *);
   int (*initialize)(mpv_handle *);
   void (*destroy)(mpv_handle *);
   void (*terminate_destroy)(mpv_handle *);
   void (*free_data)(void *);
+  int (*load_config_file)(mpv_handle *, const char *);
+  int64_t (*get_time_ns)(mpv_handle *);
+  int64_t (*get_time_us)(mpv_handle *);
   int (*set_option)(mpv_handle *, const char *, mpv_format, void *);
   int (*command)(mpv_handle *, const char **);
   int (*set_property)(mpv_handle *, const char *, mpv_format, void *);
@@ -58,6 +62,8 @@ typedef struct heya_mpv_api {
                             void *);
   int (*get_property)(mpv_handle *, const char *, mpv_format, void *);
   int (*observe_property)(mpv_handle *, uint64_t, const char *, mpv_format);
+  int (*unobserve_property)(mpv_handle *, uint64_t);
+  int (*request_event)(mpv_handle *, mpv_event_id, int);
   mpv_event *(*wait_event)(mpv_handle *, double);
   int (*render_context_create)(mpv_render_context **, mpv_handle *,
                                mpv_render_param *);
@@ -118,16 +124,22 @@ static int resolve_api(
 
   RESOLVE(client_api_version, "mpv_client_api_version");
   RESOLVE(create, "mpv_create");
+  RESOLVE(create_client, "mpv_create_client");
   RESOLVE(initialize, "mpv_initialize");
   RESOLVE(destroy, "mpv_destroy");
   RESOLVE(terminate_destroy, "mpv_terminate_destroy");
   RESOLVE(free_data, "mpv_free");
+  RESOLVE(load_config_file, "mpv_load_config_file");
+  RESOLVE(get_time_ns, "mpv_get_time_ns");
+  RESOLVE(get_time_us, "mpv_get_time_us");
   RESOLVE(set_option, "mpv_set_option");
   RESOLVE(command, "mpv_command");
   RESOLVE(set_property, "mpv_set_property");
   RESOLVE(set_property_async, "mpv_set_property_async");
   RESOLVE(get_property, "mpv_get_property");
   RESOLVE(observe_property, "mpv_observe_property");
+  RESOLVE(unobserve_property, "mpv_unobserve_property");
+  RESOLVE(request_event, "mpv_request_event");
   RESOLVE(wait_event, "mpv_wait_event");
   RESOLVE(render_context_create, "mpv_render_context_create");
   RESOLVE(render_context_free, "mpv_render_context_free");
@@ -274,6 +286,10 @@ mpv_handle *mpv_create(void) {
   return ensure_loaded() ? API.create() : NULL;
 }
 
+mpv_handle *mpv_create_client(mpv_handle *ctx, const char *name) {
+  return ensure_loaded() ? API.create_client(ctx, name) : NULL;
+}
+
 int mpv_initialize(mpv_handle *ctx) {
   return ensure_loaded() ? API.initialize(ctx) : MPV_ERROR_UNINITIALIZED;
 }
@@ -291,6 +307,19 @@ void mpv_terminate_destroy(mpv_handle *ctx) {
 void mpv_free(void *data) {
   if (ensure_loaded())
     API.free_data(data);
+}
+
+int mpv_load_config_file(mpv_handle *ctx, const char *filename) {
+  return ensure_loaded() ? API.load_config_file(ctx, filename)
+                         : MPV_ERROR_UNINITIALIZED;
+}
+
+int64_t mpv_get_time_ns(mpv_handle *ctx) {
+  return ensure_loaded() ? API.get_time_ns(ctx) : 0;
+}
+
+int64_t mpv_get_time_us(mpv_handle *ctx) {
+  return ensure_loaded() ? API.get_time_us(ctx) : 0;
 }
 
 int mpv_set_option(mpv_handle *ctx, const char *name, mpv_format format,
@@ -327,6 +356,16 @@ int mpv_observe_property(mpv_handle *ctx, uint64_t reply_userdata,
   return ensure_loaded()
              ? API.observe_property(ctx, reply_userdata, name, format)
              : MPV_ERROR_UNINITIALIZED;
+}
+
+int mpv_unobserve_property(mpv_handle *ctx, uint64_t reply_userdata) {
+  return ensure_loaded() ? API.unobserve_property(ctx, reply_userdata)
+                         : MPV_ERROR_UNINITIALIZED;
+}
+
+int mpv_request_event(mpv_handle *ctx, mpv_event_id event, int enable) {
+  return ensure_loaded() ? API.request_event(ctx, event, enable)
+                         : MPV_ERROR_UNINITIALIZED;
 }
 
 mpv_event *mpv_wait_event(mpv_handle *ctx, double timeout) {
