@@ -125,11 +125,11 @@ impl CpalOutput {
             .description()
             .map(|description| description.name().to_string())
             .unwrap_or_else(|_| device.to_string());
-        let default_device_id = host
+        #[cfg(target_os = "macos")]
+        let is_default_device = host
             .default_output_device()
             .and_then(|device| device.id().ok())
-            .map(|id| id.to_string());
-        let is_default_device = default_device_id.as_deref() == Some(device_id.as_str());
+            .is_some_and(|id| id.to_string() == device_id);
 
         #[cfg(target_os = "macos")]
         let exclusive = match request {
