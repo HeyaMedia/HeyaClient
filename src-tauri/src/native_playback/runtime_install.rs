@@ -38,7 +38,10 @@ pub enum MpvInstallProgress {
 }
 
 #[cfg(any(all(feature = "native-mpv", target_os = "windows"), test))]
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[cfg_attr(
+    not(all(feature = "native-mpv", target_os = "windows")),
+    allow(dead_code)
+)]
 mod windows {
     use super::{MpvInstallProgress, MpvInstallationOffer};
     use chrono::Utc;
