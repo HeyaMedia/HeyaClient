@@ -17,6 +17,8 @@ mod protocol;
 mod runtime_install;
 #[cfg(all(feature = "native-mpv", target_os = "macos"))]
 mod surface_macos;
+#[cfg(all(feature = "native-mpv", target_os = "windows"))]
+mod surface_windows;
 #[allow(dead_code)]
 mod validation;
 

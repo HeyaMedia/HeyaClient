@@ -98,6 +98,7 @@ struct ManagerState {
 
 struct Shared {
     state: Mutex<ManagerState>,
+    lifecycle_gate: Mutex<()>,
     sink: Arc<dyn PlaybackEventSink>,
 }
 
@@ -123,6 +124,7 @@ impl NativePlaybackManager {
         Self {
             shared: Arc::new(Shared {
                 state: Mutex::new(ManagerState::default()),
+                lifecycle_gate: Mutex::new(()),
                 sink,
             }),
             factory,
@@ -146,9 +148,14 @@ impl NativePlaybackManager {
         owner: PlaybackOwner,
         media: EngineMedia,
     ) -> Result<StartedPlayback, BridgeError> {
+        // Bridge requests run on Tauri's blocking pool and may therefore
+        // overlap. Serialize renderer replacement with disposal so a page
+        // disappearing during MPV initialization cannot leave an orphaned
+        // renderer behind or race a second load.
+        let _lifecycle = self.lock_lifecycle()?;
         // Replacement is explicit and synchronous: a new engine is never
         // created while the previous engine might still produce output.
-        self.dispose_active(TerminationReason::Disposed)?;
+        self.dispose_active_locked(TerminationReason::Disposed)?;
 
         let engine = self
             .factory
@@ -299,6 +306,7 @@ impl NativePlaybackManager {
         renderer_session_id: Option<&RendererSessionId>,
         reason: TerminationReason,
     ) -> Result<(), BridgeError> {
+        let _lifecycle = self.lock_lifecycle()?;
         let current = self.snapshot();
         let Some(current) = current else {
             return Ok(());
@@ -312,6 +320,11 @@ impl NativePlaybackManager {
     }
 
     pub fn dispose_active(&self, reason: TerminationReason) -> Result<(), BridgeError> {
+        let _lifecycle = self.lock_lifecycle()?;
+        self.dispose_active_locked(reason)
+    }
+
+    fn dispose_active_locked(&self, reason: TerminationReason) -> Result<(), BridgeError> {
         let Some(snapshot) = self.snapshot() else {
             return Ok(());
         };
@@ -414,6 +427,13 @@ impl NativePlaybackManager {
     fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, ManagerState>, BridgeError> {
         self.shared.state.lock().map_err(|_| internal_lock_error())
     }
+
+    fn lock_lifecycle(&self) -> Result<std::sync::MutexGuard<'_, ()>, BridgeError> {
+        self.shared
+            .lifecycle_gate
+            .lock()
+            .map_err(|_| internal_lock_error())
+    }
 }
 
 fn renderer_worker(
@@ -426,7 +446,10 @@ fn renderer_worker(
     let mut last_diagnostics_publication = Instant::now() - DIAGNOSTICS_PUBLICATION_INTERVAL;
 
     loop {
-        match requests.try_recv() {
+        // Wait on Heya's command channel, rather than inside mpv_wait_event.
+        // A newly queued play/pause command now wakes this worker immediately;
+        // MPV events are still drained at least every poll interval below.
+        match requests.recv_timeout(WORKER_POLL_INTERVAL) {
             Ok(WorkerRequest::Command { command, response }) => {
                 if command == PlaybackCommand::Stop {
                     let result = engine.stop(TerminationReason::Stopped);
@@ -435,7 +458,6 @@ fn renderer_worker(
                     return;
                 }
                 let _ = response.send(engine.command(&command));
-                continue;
             }
             Ok(WorkerRequest::Terminate { reason, response }) => {
                 let result = engine.stop(reason);
@@ -448,56 +470,62 @@ fn renderer_worker(
                 let _ = response.send(result);
                 return;
             }
-            Err(mpsc::TryRecvError::Disconnected) => {
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = engine.stop(TerminationReason::Disposed);
                 finish_session(&shared, &renderer_session_id, TerminationReason::Disposed);
                 return;
             }
-            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
 
-        match engine.poll_event(WORKER_POLL_INTERVAL) {
-            Ok(Some(EngineEvent::State { state, kind })) => {
-                let publish = kind == StateUpdateKind::Structural
-                    || last_position_publication.elapsed() >= POSITION_PUBLICATION_INTERVAL;
-                if publish {
-                    publish_state(&shared, &renderer_session_id, state);
-                    if kind == StateUpdateKind::Position {
-                        last_position_publication = Instant::now();
+        // One MPV callback can cover several events. Drain the queue without
+        // blocking so state confirmation and diagnostics never delay the next
+        // semantic command.
+        loop {
+            match engine.poll_event(Duration::ZERO) {
+                Ok(Some(EngineEvent::State { state, kind })) => {
+                    let publish = kind == StateUpdateKind::Structural
+                        || last_position_publication.elapsed() >= POSITION_PUBLICATION_INTERVAL;
+                    if publish {
+                        publish_state(&shared, &renderer_session_id, state);
+                        if kind == StateUpdateKind::Position {
+                            last_position_publication = Instant::now();
+                        }
+                    } else {
+                        remember_state(&shared, &renderer_session_id, state);
                     }
-                } else {
-                    remember_state(&shared, &renderer_session_id, state);
                 }
-            }
-            Ok(Some(EngineEvent::Diagnostics {
-                diagnostics,
-                structural,
-            })) => {
-                if structural
-                    || last_diagnostics_publication.elapsed() >= DIAGNOSTICS_PUBLICATION_INTERVAL
-                {
-                    publish_diagnostics(&shared, &renderer_session_id, *diagnostics);
-                    last_diagnostics_publication = Instant::now();
+                Ok(Some(EngineEvent::Diagnostics {
+                    diagnostics,
+                    structural,
+                })) => {
+                    if structural
+                        || last_diagnostics_publication.elapsed()
+                            >= DIAGNOSTICS_PUBLICATION_INTERVAL
+                    {
+                        publish_diagnostics(&shared, &renderer_session_id, *diagnostics);
+                        last_diagnostics_publication = Instant::now();
+                    }
                 }
-            }
-            Ok(Some(EngineEvent::Terminated(reason))) => {
-                finish_session(&shared, &renderer_session_id, reason);
-                return;
-            }
-            Ok(None) => {}
-            Err(error) => {
-                log::error!(
-                    "native renderer {} failed: {}",
-                    renderer_session_id.as_str(),
-                    error
-                );
-                let _ = engine.stop(TerminationReason::NativeCrashed);
-                finish_session(
-                    &shared,
-                    &renderer_session_id,
-                    TerminationReason::NativeCrashed,
-                );
-                return;
+                Ok(Some(EngineEvent::Terminated(reason))) => {
+                    finish_session(&shared, &renderer_session_id, reason);
+                    return;
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    log::error!(
+                        "native renderer {} failed: {}",
+                        renderer_session_id.as_str(),
+                        error
+                    );
+                    let _ = engine.stop(TerminationReason::NativeCrashed);
+                    finish_session(
+                        &shared,
+                        &renderer_session_id,
+                        TerminationReason::NativeCrashed,
+                    );
+                    return;
+                }
             }
         }
     }

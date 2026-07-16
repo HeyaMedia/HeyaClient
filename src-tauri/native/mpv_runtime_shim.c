@@ -54,6 +54,8 @@ typedef struct heya_mpv_api {
   int (*set_option)(mpv_handle *, const char *, mpv_format, void *);
   int (*command)(mpv_handle *, const char **);
   int (*set_property)(mpv_handle *, const char *, mpv_format, void *);
+  int (*set_property_async)(mpv_handle *, uint64_t, const char *, mpv_format,
+                            void *);
   int (*get_property)(mpv_handle *, const char *, mpv_format, void *);
   int (*observe_property)(mpv_handle *, uint64_t, const char *, mpv_format);
   mpv_event *(*wait_event)(mpv_handle *, double);
@@ -123,6 +125,7 @@ static int resolve_api(
   RESOLVE(set_option, "mpv_set_option");
   RESOLVE(command, "mpv_command");
   RESOLVE(set_property, "mpv_set_property");
+  RESOLVE(set_property_async, "mpv_set_property_async");
   RESOLVE(get_property, "mpv_get_property");
   RESOLVE(observe_property, "mpv_observe_property");
   RESOLVE(wait_event, "mpv_wait_event");
@@ -304,6 +307,13 @@ int mpv_set_property(mpv_handle *ctx, const char *name, mpv_format format,
                      void *data) {
   return ensure_loaded() ? API.set_property(ctx, name, format, data)
                          : MPV_ERROR_UNINITIALIZED;
+}
+
+int mpv_set_property_async(mpv_handle *ctx, uint64_t reply_userdata,
+                           const char *name, mpv_format format, void *data) {
+  return ensure_loaded()
+             ? API.set_property_async(ctx, reply_userdata, name, format, data)
+             : MPV_ERROR_UNINITIALIZED;
 }
 
 int mpv_get_property(mpv_handle *ctx, const char *name, mpv_format format,

@@ -8,10 +8,12 @@ use super::{
 };
 use libmpv2::{
     events::{Event, PropertyData as MpvPropertyData},
-    mpv_end_file_reason, mpv_error, EndFileReason, Error as MpvError, Format, Mpv,
+    mpv_end_file_reason, mpv_error, mpv_format, EndFileReason, Error as MpvError, Format, Mpv,
+    SetData,
 };
 use std::{
     collections::{HashMap, VecDeque},
+    ffi::CString,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -26,17 +28,17 @@ const SYNTHETIC_VIDEO_SOURCE: &str = "av://lavfi:testsrc2=duration=30:size=1280x
 const PLAYBACK_GRANT_HEADER_NAME: &str = "X-Heya-Playback-Grant";
 
 pub struct MpvEngineFactory {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     app: AppHandle,
 }
 
 impl MpvEngineFactory {
     pub fn new(app: AppHandle) -> Self {
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let _ = app;
 
         Self {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             app,
         }
     }
@@ -58,7 +60,7 @@ impl PlaybackEngineFactory for MpvEngineFactory {
             };
         PlaybackCapabilities::mpv(
             available,
-            if cfg!(target_os = "macos") {
+            if cfg!(any(target_os = "macos", target_os = "windows")) {
                 NativeVideoSurface::NativeSurface
             } else {
                 NativeVideoSurface::NativeWindow
@@ -70,7 +72,7 @@ impl PlaybackEngineFactory for MpvEngineFactory {
     fn create(&self, media: EngineMedia) -> Result<Box<dyn PlaybackEngine>, EngineError> {
         match media {
             EngineMedia::Production(load) => {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 {
                     match MpvEngine::new_production_embedded(load.clone(), self.app.clone()) {
                         Ok(engine) => return Ok(Box::new(engine) as _),
@@ -101,19 +103,21 @@ enum DevelopmentSource {
 }
 
 struct MpvEngine {
-    // Field order is a safety invariant: Rust drops fields in declaration
-    // order, and libmpv requires every render context to be freed before the
-    // owning mpv core. Keeping the embedded renderer before `mpv` prevents an
-    // abort even if the engine is unwound after a partial teardown.
+    // Field order is a platform safety invariant. macOS must free its libmpv
+    // render context before the mpv core, while Windows must stop mpv and its
+    // child renderer before destroying MPV's parent HWND.
     #[cfg(target_os = "macos")]
     embedded_renderer: Option<super::surface_macos::MacEmbeddedRenderer>,
     mpv: Mpv,
+    #[cfg(target_os = "windows")]
+    embedded_renderer: Option<super::surface_windows::WindowsEmbeddedRenderer>,
     video_surface: NativeVideoSurface,
     state: NativePlaybackState,
     diagnostics: PlaybackDiagnostics,
     queued: VecDeque<EngineEvent>,
     audio_track_map: HashMap<NormalizedTrackId, i64>,
     subtitle_track_map: HashMap<NormalizedTrackId, i64>,
+    next_async_request_id: u64,
 }
 
 enum PropertyData {
@@ -138,7 +142,16 @@ impl PropertyData {
 
 impl MpvEngine {
     fn new_production_window(load: ValidatedPlaybackLoad) -> Result<Self, EngineError> {
-        Self::new_production(load, MpvOutput::NativeWindow, None)
+        let mpv = create_mpv(MpvOutput::NativeWindow)?;
+        Self::finish_production(
+            load,
+            mpv,
+            NativeVideoSurface::NativeWindow,
+            #[cfg(target_os = "macos")]
+            None,
+            #[cfg(target_os = "windows")]
+            None,
+        )
     }
 
     #[cfg(target_os = "macos")]
@@ -146,26 +159,49 @@ impl MpvEngine {
         load: ValidatedPlaybackLoad,
         app: AppHandle,
     ) -> Result<Self, EngineError> {
-        Self::new_production(load, MpvOutput::Embedded, Some(app))
+        let mpv = create_mpv(MpvOutput::RenderApi)?;
+        let renderer = super::surface_macos::MacEmbeddedRenderer::attach(app, &mpv)?;
+        Self::finish_production(load, mpv, NativeVideoSurface::NativeSurface, Some(renderer))
     }
 
-    fn new_production(
+    #[cfg(target_os = "windows")]
+    fn new_production_embedded(
         load: ValidatedPlaybackLoad,
-        output: MpvOutput,
-        #[cfg(target_os = "macos")] app: Option<AppHandle>,
-        #[cfg(not(target_os = "macos"))] _app: Option<AppHandle>,
+        app: AppHandle,
     ) -> Result<Self, EngineError> {
-        let mpv = create_mpv(output)?;
-        #[cfg(target_os = "macos")]
-        let embedded_renderer = if output == MpvOutput::Embedded {
-            Some(super::surface_macos::MacEmbeddedRenderer::attach(
-                app.ok_or_else(|| EngineError::unavailable("the Heya app handle is unavailable"))?,
-                &mpv,
-            )?)
-        } else {
-            None
-        };
-        observe_properties(&mpv)?;
+        // The parent must exist before mpv_initialize: MPV consumes `wid`
+        // during initialization and creates its renderer child inside it.
+        let renderer = super::surface_windows::WindowsEmbeddedRenderer::attach(app)?;
+        let mpv = create_mpv(MpvOutput::EmbeddedWindow {
+            window_id: renderer.mpv_window_id(),
+        })?;
+        Self::finish_production(load, mpv, NativeVideoSurface::NativeSurface, Some(renderer))
+    }
+
+    fn finish_production(
+        load: ValidatedPlaybackLoad,
+        mpv: Mpv,
+        video_surface: NativeVideoSurface,
+        #[cfg(target_os = "macos")] embedded_renderer: Option<
+            super::surface_macos::MacEmbeddedRenderer,
+        >,
+        #[cfg(target_os = "windows")] embedded_renderer: Option<
+            super::surface_windows::WindowsEmbeddedRenderer,
+        >,
+    ) -> Result<Self, EngineError> {
+        // Construct the engine before any fallible MPV configuration. That
+        // makes the platform-specific field order below authoritative even on
+        // partial initialization: macOS drops its render context before mpv,
+        // while Windows drops mpv before its parent HWND.
+        let engine = Self::initial(
+            mpv,
+            video_surface,
+            #[cfg(target_os = "macos")]
+            embedded_renderer,
+            #[cfg(target_os = "windows")]
+            embedded_renderer,
+        );
+        observe_properties(&engine.mpv)?;
 
         // The remote page can provide only the opaque grant value. The header
         // name is fixed here and neither the grant nor arbitrary MPV options
@@ -174,25 +210,18 @@ impl MpvEngine {
             "{PLAYBACK_GRANT_HEADER_NAME}: {}",
             load.playback_grant_header_value()
         );
-        mpv.set_property("http-header-fields", playback_header)
+        engine
+            .mpv
+            .set_property("http-header-fields", playback_header)
             .map_err(|error| mpv_command_error("could not configure native media access", error))?;
         load_source(
-            &mpv,
+            &engine.mpv,
             load.media_url().as_str(),
             load.start_position_seconds(),
         )
         .map_err(|error| mpv_command_error("could not load native Heya media", error))?;
 
-        Ok(Self::initial(
-            mpv,
-            if output == MpvOutput::Embedded {
-                NativeVideoSurface::NativeSurface
-            } else {
-                NativeVideoSurface::NativeWindow
-            },
-            #[cfg(target_os = "macos")]
-            embedded_renderer,
-        ))
+        Ok(engine)
     }
 
     #[cfg(debug_assertions)]
@@ -226,6 +255,8 @@ impl MpvEngine {
             NativeVideoSurface::NativeWindow,
             #[cfg(target_os = "macos")]
             None,
+            #[cfg(target_os = "windows")]
+            None,
         ))
     }
 
@@ -235,11 +266,16 @@ impl MpvEngine {
         #[cfg(target_os = "macos")] embedded_renderer: Option<
             super::surface_macos::MacEmbeddedRenderer,
         >,
+        #[cfg(target_os = "windows")] embedded_renderer: Option<
+            super::surface_windows::WindowsEmbeddedRenderer,
+        >,
     ) -> Self {
         Self {
             #[cfg(target_os = "macos")]
             embedded_renderer,
             mpv,
+            #[cfg(target_os = "windows")]
+            embedded_renderer,
             video_surface,
             state: NativePlaybackState {
                 loading: true,
@@ -251,7 +287,53 @@ impl MpvEngine {
             queued: VecDeque::new(),
             audio_track_map: HashMap::new(),
             subtitle_track_map: HashMap::new(),
+            next_async_request_id: 1,
         }
+    }
+
+    /// Queue a desired-state property change in MPV without waiting for its
+    /// core thread to acknowledge it. Synchronous property setters can block
+    /// for hundreds of milliseconds while the renderer is busy, which makes
+    /// otherwise trivial transport controls feel disconnected from the UI.
+    /// MPV copies `data` before returning and reports a later failure through
+    /// its normal event queue.
+    fn set_property_async<T: SetData>(&mut self, name: &str, data: T) -> Result<(), MpvError> {
+        let name = CString::new(name)?;
+        let format = match T::get_format() {
+            Format::String => mpv_format::String,
+            Format::Flag => mpv_format::Flag,
+            Format::Int64 => mpv_format::Int64,
+            Format::Double => mpv_format::Double,
+            Format::Node => mpv_format::Node,
+        };
+        let request_id = self.next_async_request_id;
+        self.next_async_request_id = self.next_async_request_id.wrapping_add(1).max(1);
+        data.call_as_c_void(|data| {
+            let result = unsafe {
+                libmpv2_sys::mpv_set_property_async(
+                    self.mpv.ctx.as_ptr(),
+                    request_id,
+                    name.as_ptr(),
+                    format,
+                    data,
+                )
+            };
+            if result == mpv_error::Success {
+                Ok(())
+            } else {
+                Err(MpvError::Raw(result))
+            }
+        })
+    }
+
+    fn publish_desired_transport_state(&mut self, paused: bool) {
+        self.state.paused = paused;
+        self.state.playing = !paused;
+        self.state.ended = false;
+        self.queued.push_back(EngineEvent::State {
+            state: self.state.clone(),
+            kind: StateUpdateKind::Structural,
+        });
     }
 
     fn apply_property(&mut self, name: &str, change: PropertyData) -> Option<EngineEvent> {
@@ -553,19 +635,31 @@ impl PlaybackEngine for MpvEngine {
     }
 
     fn command(&mut self, command: &PlaybackCommand) -> Result<(), EngineError> {
-        match command {
-            PlaybackCommand::Play => self.mpv.set_property("pause", false),
-            PlaybackCommand::Pause => self.mpv.set_property("pause", true),
+        let result = match command {
+            PlaybackCommand::Play => {
+                let result = self.set_property_async("pause", false);
+                if result.is_ok() {
+                    self.publish_desired_transport_state(false);
+                }
+                result
+            }
+            PlaybackCommand::Pause => {
+                let result = self.set_property_async("pause", true);
+                if result.is_ok() {
+                    self.publish_desired_transport_state(true);
+                }
+                result
+            }
             PlaybackCommand::Seek { position_seconds } => {
                 self.state.seek_revision = self.state.seek_revision.saturating_add(1);
-                self.mpv.set_property("time-pos", *position_seconds)
+                self.set_property_async("time-pos", *position_seconds)
             }
             PlaybackCommand::SetVolume { volume } => {
-                self.mpv.set_property("volume", volume * 100.0)
+                self.set_property_async("volume", volume * 100.0)
             }
-            PlaybackCommand::SetMuted { muted } => self.mpv.set_property("mute", *muted),
+            PlaybackCommand::SetMuted { muted } => self.set_property_async("mute", *muted),
             PlaybackCommand::SetFullscreen { fullscreen } => {
-                #[cfg(target_os = "macos")]
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
                 if let Some(renderer) = &self.embedded_renderer {
                     renderer.set_fullscreen(*fullscreen)?;
                     self.state.fullscreen = *fullscreen;
@@ -575,22 +669,22 @@ impl PlaybackEngine for MpvEngine {
                     });
                     return Ok(());
                 }
-                self.mpv.set_property("fullscreen", *fullscreen)
+                self.set_property_async("fullscreen", *fullscreen)
             }
             PlaybackCommand::SelectAudioTrack { track_id } => {
-                let raw_id = self.audio_track_map.get(track_id).ok_or_else(|| {
+                let raw_id = *self.audio_track_map.get(track_id).ok_or_else(|| {
                     EngineError::command("the selected audio track is unavailable")
                 })?;
-                self.mpv.set_property("aid", *raw_id)
+                self.set_property_async("aid", raw_id)
             }
             PlaybackCommand::SelectSubtitleTrack { track_id } => match track_id {
                 Some(track_id) => {
-                    let raw_id = self.subtitle_track_map.get(track_id).ok_or_else(|| {
+                    let raw_id = *self.subtitle_track_map.get(track_id).ok_or_else(|| {
                         EngineError::command("the selected subtitle track is unavailable")
                     })?;
-                    self.mpv.set_property("sid", *raw_id)
+                    self.set_property_async("sid", raw_id)
                 }
-                None => self.mpv.set_property("sid", "no"),
+                None => self.set_property_async("sid", "no"),
             },
             PlaybackCommand::SelectVariant { .. } => {
                 return Err(EngineError::command(
@@ -598,8 +692,8 @@ impl PlaybackEngine for MpvEngine {
                 ));
             }
             PlaybackCommand::Stop => unreachable!("stop is handled by the renderer worker"),
-        }
-        .map_err(|error| mpv_command_error("MPV rejected the playback command", error))
+        };
+        result.map_err(|error| mpv_command_error("MPV rejected the playback command", error))
     }
 
     fn poll_event(&mut self, timeout: Duration) -> Result<Option<EngineEvent>, EngineError> {
@@ -628,7 +722,15 @@ impl PlaybackEngine for MpvEngine {
             Ok(Event::FileLoaded) => {
                 self.state.loading = false;
                 self.state.ended = false;
+                #[cfg(target_os = "macos")]
                 if self.video_surface == NativeVideoSurface::NativeWindow {
+                    self.state.video_surface_ready = true;
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    // Win32 `wid` playback is ready when MPV has created and
+                    // loaded its renderer child. macOS instead waits for its
+                    // render API callback to present the first actual frame.
                     self.state.video_surface_ready = true;
                 }
                 self.state.paused = self.mpv.get_property("pause").unwrap_or(false);
@@ -698,8 +800,23 @@ fn probe_libmpv() -> Result<(), EngineError> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MpvOutput {
     NativeWindow,
-    Embedded,
+    #[cfg(target_os = "macos")]
+    RenderApi,
+    #[cfg(target_os = "windows")]
+    EmbeddedWindow {
+        window_id: u32,
+    },
     Probe,
+}
+
+impl MpvOutput {
+    fn is_probe(self) -> bool {
+        self == Self::Probe
+    }
+
+    fn uses_own_window_input(self) -> bool {
+        self == Self::NativeWindow
+    }
 }
 
 fn create_mpv(output: MpvOutput) -> Result<Mpv, EngineError> {
@@ -721,22 +838,22 @@ fn create_mpv(output: MpvOutput) -> Result<Mpv, EngineError> {
             "vo",
             match output {
                 MpvOutput::NativeWindow => "gpu-next",
-                MpvOutput::Embedded => "libmpv",
+                #[cfg(target_os = "macos")]
+                MpvOutput::RenderApi => "libmpv",
+                #[cfg(target_os = "windows")]
+                MpvOutput::EmbeddedWindow { .. } => "gpu-next",
                 MpvOutput::Probe => "null",
             },
         )?;
-        initializer.set_option(
-            "audio",
-            if output == MpvOutput::Probe {
-                "no"
-            } else {
-                "auto"
-            },
-        )?;
+        #[cfg(target_os = "windows")]
+        if let MpvOutput::EmbeddedWindow { window_id } = output {
+            initializer.set_option("wid", window_id.to_string())?;
+        }
+        initializer.set_option("audio", if output.is_probe() { "no" } else { "auto" })?;
         initializer.set_option("title", "Heya Native Player")?;
         initializer.set_option("hwdec", "auto-safe")?;
-        initializer.set_option("input-default-bindings", output == MpvOutput::NativeWindow)?;
-        initializer.set_option("input-vo-keyboard", output == MpvOutput::NativeWindow)?;
+        initializer.set_option("input-default-bindings", output.uses_own_window_input())?;
+        initializer.set_option("input-vo-keyboard", output.uses_own_window_input())?;
         initializer.set_option("sub-auto", "no")?;
         initializer.set_option("audio-file-auto", "no")?;
         Ok(())

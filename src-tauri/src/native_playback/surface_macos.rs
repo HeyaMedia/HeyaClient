@@ -12,8 +12,8 @@ use libmpv2_sys as mpv_sys;
 use objc2::{rc::Retained, AnyThread, MainThreadMarker, MainThreadOnly};
 #[allow(deprecated)]
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSOpenGLContext, NSOpenGLPFADoubleBuffer, NSOpenGLPixelFormat,
-    NSOpenGLView, NSResponder, NSView, NSWindowOrderingMode,
+    NSAutoresizingMaskOptions, NSOpenGLContext, NSOpenGLContextParameter, NSOpenGLPFADoubleBuffer,
+    NSOpenGLPixelFormat, NSOpenGLView, NSResponder, NSView, NSWindowOrderingMode,
 };
 use objc2_foundation::NSLocking;
 use std::{
@@ -371,6 +371,17 @@ unsafe fn attach_on_main(inner: &Arc<Inner>, webview: *mut c_void) -> Result<(),
     let gl_context = gl_view
         .openGLContext()
         .ok_or_else(|| EngineError::unavailable("the embedded OpenGL context is unavailable"))?;
+    // Match MPV's Cocoa render example: the drawable must swap on display
+    // refresh. Without an explicit interval, flushBuffer may return before the
+    // frame is presented and libmpv's audio/video timing becomes visibly
+    // bursty under WKWebView composition.
+    let mut swap_interval = 1_i32;
+    unsafe {
+        gl_context.setValues_forParameter(
+            NonNull::from(&mut swap_interval),
+            NSOpenGLContextParameter::SwapInterval,
+        );
+    }
     parent.addSubview_positioned_relativeTo(&gl_view, NSWindowOrderingMode::Below, Some(webview));
     gl_context.makeCurrentContext();
     gl_context.update(mtm);
@@ -555,7 +566,10 @@ unsafe fn render_on_worker(inner: &Inner, render_context: *mut mpv_sys::mpv_rend
         log::info!("embedded MPV rendered its first frame at {width}x{height}");
     }
     gl_context.flushBuffer();
-    unsafe { mpv_sys::mpv_render_context_report_swap(render_context) };
+    // Do not call mpv_render_context_report_swap here. It is optional, and
+    // reporting immediately after flushBuffer is not guaranteed to represent
+    // the compositor's actual presentation time. Calling it inconsistently or
+    // too early actively degrades MPV's frame scheduling.
     NSOpenGLContext::clearCurrentContext();
 }
 

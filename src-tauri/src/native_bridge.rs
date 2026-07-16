@@ -79,12 +79,27 @@ fn native_audio_request<R: Runtime>(
 }
 
 #[tauri::command]
-fn native_playback_request<R: Runtime>(
+async fn native_playback_request<R: Runtime>(
     app: AppHandle<R>,
     webview: WebviewWindow<R>,
     request: NativeBridgeRequest,
 ) -> native_playback::BridgeResponse<Value> {
-    native_playback::handle_playback_ipc(&app, &webview, request)
+    // Creating libmpv, attaching its native surface, and waiting for renderer
+    // commands are deliberately synchronous inside the playback manager. Do
+    // that work on Tauri's blocking pool: a synchronous command handler runs
+    // on the window event loop and would freeze the WebView (and prevent the
+    // AppKit/Win32 surface callback from running) during decoder/GPU startup.
+    match tauri::async_runtime::spawn_blocking(move || {
+        native_playback::handle_playback_ipc(&app, &webview, request)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => native_playback::BridgeResponse::failure(native_playback::BridgeError::new(
+            native_playback::BridgeErrorCode::InternalError,
+            "the native playback request worker stopped unexpectedly",
+        )),
+    }
 }
 
 #[tauri::command]

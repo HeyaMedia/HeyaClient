@@ -1,6 +1,6 @@
 [package]
 name = "heya-client"
-version = "0.2.2"
+version = "0.2.3"
 description = "Cross-platform native client for Heya"
 authors = ["HeyaMedia"]
 license = "MIT"
@@ -56,6 +56,10 @@ cpal = { version = "0.18.1", features = ["realtime"] }
 # windows crate. Pin the matching generation until CPAL narrows that range;
 # mixing the two makes its COM implementations fail to compile on Windows.
 windows-core = "=0.61.2"
+# The embedded video surface is a deliberately small Win32 child window. MPV
+# owns its renderer inside that host through its documented `wid` option;
+# Heya never exposes the HWND or arbitrary MPV options to the remote page.
+windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 sevenz-rust2 = { version = "0.20.2", default-features = false }
 sha2 = "0.10.9"
 
@@ -70,5 +74,5 @@ sha2 = "0.10.9"
 block2 = "0.6.2"
 coreaudio-rs = "0.14.2"
 objc2 = "0.6.4"
-objc2-app-kit = { version = "0.3.2", default-features = false, features = ["block2", "NSButton", "NSControl", "NSEvent", "NSGraphics", "NSOpenGL", "NSOpenGLView", "NSResponder", "NSView", "NSWindow"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["block2", "NSButton", "NSControl", "NSEvent", "NSGraphics", "NSOpenGL", "NSOpenGLView", "NSResponder", "NSView", "NSWindow", "objc2-open-gl"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSGeometry", "NSObject"] }

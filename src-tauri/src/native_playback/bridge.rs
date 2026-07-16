@@ -41,6 +41,18 @@ pub fn lifecycle_plugin<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
                 }
             }
 
+            #[cfg(all(feature = "native-mpv", target_os = "windows"))]
+            if let RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::Resized(size),
+                ..
+            } = event
+            {
+                if label == navigation::MAIN_WINDOW_LABEL {
+                    super::surface_windows::resize_active_surface(size.width, size.height);
+                }
+            }
+
             let reason = match event {
                 RunEvent::Exit | RunEvent::ExitRequested { .. } => Some(TerminationReason::AppQuit),
                 RunEvent::WindowEvent { label, event, .. }
