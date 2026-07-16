@@ -264,11 +264,13 @@ impl<R: Runtime> TauriPlaybackEventSink<R> {
     }
 
     fn emit<T: serde::Serialize>(&self, owner: &PlaybackOwner, event_name: &str, event: &T) {
+        #[cfg(debug_assertions)]
         let owner = match owner {
             PlaybackOwner::Web(owner) => owner,
-            #[cfg(debug_assertions)]
             PlaybackOwner::NativeDevelopmentHarness => return,
         };
+        #[cfg(not(debug_assertions))]
+        let PlaybackOwner::Web(owner) = owner;
         let Some(window) = self.app.get_webview_window(navigation::MAIN_WINDOW_LABEL) else {
             return;
         };

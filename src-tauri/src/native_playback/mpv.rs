@@ -1,11 +1,10 @@
 use super::{
     sanitize_diagnostic_label, AudioDiagnostics, AudioOutputDiagnostics, AudioSourceDiagnostics,
-    BridgeErrorCode, EngineError, EngineEvent, EngineMedia, HealthDiagnostics,
-    NativePlaybackManager, NativePlaybackState, NativeTrack, NativeTrackKind, NativeVideoSurface,
-    NormalizedTrackId, PlaybackCapabilities, PlaybackCommand, PlaybackDiagnostics, PlaybackEngine,
-    PlaybackEngineFactory, StateUpdateKind, TerminationReason, TransportDiagnostics,
-    ValidatedPlaybackLoad, VideoColorDiagnostics, VideoDecodedDiagnostics, VideoDiagnostics,
-    VideoOutputDiagnostics, VideoSourceDiagnostics,
+    BridgeErrorCode, EngineError, EngineEvent, EngineMedia, HealthDiagnostics, NativePlaybackState,
+    NativeTrack, NativeTrackKind, NativeVideoSurface, NormalizedTrackId, PlaybackCapabilities,
+    PlaybackCommand, PlaybackDiagnostics, PlaybackEngine, PlaybackEngineFactory, StateUpdateKind,
+    TerminationReason, TransportDiagnostics, ValidatedPlaybackLoad, VideoColorDiagnostics,
+    VideoDecodedDiagnostics, VideoDiagnostics, VideoOutputDiagnostics, VideoSourceDiagnostics,
 };
 use libmpv2::{
     events::{Event, PropertyData as MpvPropertyData},
@@ -13,7 +12,6 @@ use libmpv2::{
 };
 use std::{
     collections::{HashMap, VecDeque},
-    fs,
     path::{Path, PathBuf},
     sync::OnceLock,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -23,6 +21,7 @@ use tauri::AppHandle;
 pub const NATIVE_MPV_SPIKE_MENU_ID: &str = "native-mpv-window-spike";
 pub const NATIVE_MPV_FULLSCREEN_ON_MENU_ID: &str = "native-mpv-fullscreen-on";
 pub const NATIVE_MPV_FULLSCREEN_OFF_MENU_ID: &str = "native-mpv-fullscreen-off";
+#[cfg(debug_assertions)]
 const SYNTHETIC_VIDEO_SOURCE: &str = "av://lavfi:testsrc2=duration=30:size=1280x720:rate=30";
 const PLAYBACK_GRANT_HEADER_NAME: &str = "X-Heya-Playback-Grant";
 
@@ -898,7 +897,7 @@ fn bundled_vulkan_manifest(executable: &Path) -> Option<PathBuf> {
 
 /// Starts native-only local media. No path or URL crosses the WebView bridge.
 #[cfg(debug_assertions)]
-pub fn start_development_harness(manager: &NativePlaybackManager) -> Result<(), String> {
+pub fn start_development_harness(manager: &super::NativePlaybackManager) -> Result<(), String> {
     let media = find_development_media()
         .map(EngineMedia::DevelopmentFile)
         .unwrap_or(EngineMedia::Synthetic);
@@ -926,7 +925,7 @@ fn find_development_media() -> Option<PathBuf> {
     ];
     directories
         .into_iter()
-        .filter_map(|directory| fs::read_dir(directory).ok())
+        .filter_map(|directory| std::fs::read_dir(directory).ok())
         .flatten()
         .filter_map(Result::ok)
         .filter_map(|entry| {

@@ -27,10 +27,16 @@ pub(crate) use validation::validate_load;
 pub use validation::{PlaybackValidationError, ValidatedPlaybackLoad};
 
 #[cfg(all(
+    debug_assertions,
+    feature = "native-mpv",
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+))]
+pub use mpv::start_development_harness;
+#[cfg(all(
     feature = "native-mpv",
     any(target_os = "macos", target_os = "windows", target_os = "linux")
 ))]
 pub use mpv::{
-    configure_bundled_vulkan_loader, start_development_harness, MpvEngineFactory,
-    NATIVE_MPV_FULLSCREEN_OFF_MENU_ID, NATIVE_MPV_FULLSCREEN_ON_MENU_ID, NATIVE_MPV_SPIKE_MENU_ID,
+    configure_bundled_vulkan_loader, MpvEngineFactory, NATIVE_MPV_FULLSCREEN_OFF_MENU_ID,
+    NATIVE_MPV_FULLSCREEN_ON_MENU_ID, NATIVE_MPV_SPIKE_MENU_ID,
 };
