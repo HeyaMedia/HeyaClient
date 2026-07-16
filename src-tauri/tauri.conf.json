@@ -4,20 +4,27 @@
   "version": "0.1.0",
   "identifier": "media.heya.client",
   "build": {
-    "frontendDist": "../bootstrap"
+    "beforeDevCommand": "bun run bootstrap:build",
+    "beforeBuildCommand": "bun run bootstrap:build",
+    "frontendDist": "../bootstrap/dist"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
+        "label": "main",
         "title": "Heya",
         "width": 800,
         "height": 600,
+        "minWidth": 420,
+        "minHeight": 520,
         "resizable": true,
-        "fullscreen": false
+        "fullscreen": false,
+        "create": false
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; connect-src ipc: http://ipc.localhost; img-src 'self' data:; style-src 'self'; script-src 'self'"
     }
   },
   "bundle": {

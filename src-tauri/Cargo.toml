@@ -3,10 +3,10 @@ name = "heya-client"
 version = "0.1.0"
 description = "Cross-platform native client for Heya"
 authors = ["HeyaMedia"]
-license = ""
+license = "MIT"
 repository = "https://github.com/HeyaMedia/HeyaClient"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.85.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -14,12 +14,51 @@ rust-version = "1.77.2"
 name = "heya_client_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+native-mpv = [
+    "dep:libmpv2",
+    "dep:libmpv2-sys",
+    "dep:objc2",
+    "dep:objc2-app-kit",
+    "dep:objc2-foundation",
+]
+
 [build-dependencies]
+pkg-config = "0.3.32"
 tauri-build = { version = "2.6.3", features = [] }
 
 [dependencies]
-serde_json = "1.0"
-serde = { version = "1.0", features = ["derive"] }
+chrono = { version = "0.4.45", features = ["serde"] }
 log = "0.4"
-tauri = { version = "2.11.3", features = [] }
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+realfft = "3.5"
+reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tauri = { version = "2.11.3", features = ["macos-private-api"] }
 tauri-plugin-log = "2"
+tauri-plugin-opener = "2.5.4"
+uuid = { version = "1.18.1", features = ["serde", "v4"] }
+tracing = "0.1"
+symphonia = { version = "0.5.5", features = ["all"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
+libmpv2 = { version = "6.0.0", default-features = false, optional = true }
+libmpv2-sys = { version = "4.0.1", optional = true }
+tauri-plugin-window-state = "2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# WASAPI is CPAL's default Windows backend. Its realtime feature promotes the
+# device callback thread so UI/WebView activity is less likely to cause an
+# audible deadline miss.
+cpal = { version = "0.18.1", features = ["realtime"] }
+
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+cpal = "0.18.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+coreaudio-rs = "0.14.2"
+objc2 = { version = "0.6.4", optional = true }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSGraphics", "NSOpenGL", "NSOpenGLView", "NSResponder", "NSView", "NSWindow"], optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSGeometry", "NSObject"], optional = true }

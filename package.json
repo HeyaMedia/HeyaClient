@@ -1,14 +1,25 @@
 {
   "name": "heya-client",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "scripts": {
+    "bootstrap:build": "bun build bootstrap/index.html --minify --outdir bootstrap/dist",
+    "bootstrap:check": "tsc --noEmit",
+    "native:stage:macos": "python3 scripts/stage-macos-libmpv.py",
+    "native:verify:macos": "sh scripts/verify-macos-native-bundle.sh",
     "tauri": "tauri",
     "dev": "tauri dev",
-    "build": "tauri build"
+    "dev:native": "tauri dev --features native-mpv",
+    "build": "tauri build",
+    "build:native": "tauri build --features native-mpv"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.11.4"
+    "@tauri-apps/cli": "^2.11.4",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1"
   }
 }

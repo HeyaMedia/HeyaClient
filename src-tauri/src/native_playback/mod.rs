@@ -1,0 +1,35 @@
+//! Native playback service and its narrow, versioned WebView boundary.
+//!
+//! Raw renderer operations remain inside Rust. The selected Heya origin gets a
+//! semantic playback object backed by a custom protocol; it has no Tauri
+//! capability and this service never invokes through Tauri's generic IPC.
+
+mod bridge;
+mod engine;
+mod manager;
+#[cfg(all(
+    feature = "native-mpv",
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+))]
+mod mpv;
+mod protocol;
+#[cfg(all(feature = "native-mpv", target_os = "macos"))]
+mod surface_macos;
+#[allow(dead_code)]
+mod validation;
+
+pub use bridge::*;
+pub use engine::*;
+pub use manager::*;
+pub use protocol::*;
+pub(crate) use validation::validate_load;
+pub use validation::{PlaybackValidationError, ValidatedPlaybackLoad};
+
+#[cfg(all(
+    feature = "native-mpv",
+    any(target_os = "macos", target_os = "windows", target_os = "linux")
+))]
+pub use mpv::{
+    configure_bundled_vulkan_loader, start_development_harness, MpvEngineFactory,
+    NATIVE_MPV_FULLSCREEN_OFF_MENU_ID, NATIVE_MPV_FULLSCREEN_ON_MENU_ID, NATIVE_MPV_SPIKE_MENU_ID,
+};

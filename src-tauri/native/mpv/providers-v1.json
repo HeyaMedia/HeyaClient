@@ -1,0 +1,46 @@
+{
+  "schemaVersion": 1,
+  "userInitiatedOnly": true,
+  "automaticInstall": false,
+  "automaticUpdate": false,
+  "macos": {
+    "status": "planned",
+    "installKind": "homebrew",
+    "formula": "mpv",
+    "minimumVersion": "0.41.0",
+    "brewExecutables": [
+      "/opt/homebrew/bin/brew",
+      "/usr/local/bin/brew"
+    ],
+    "providerPage": "https://formulae.brew.sh/formula/mpv",
+    "notes": "Use an existing Homebrew installation. Never install or remove Homebrew itself, and never uninstall a user-owned MPV installation."
+  },
+  "windows": {
+    "status": "planned",
+    "installKind": "verifiedArchive",
+    "provider": "shinchiro/mpv-winbuild-cmake",
+    "providerPage": "https://github.com/shinchiro/mpv-winbuild-cmake/releases/tag/20260610",
+    "release": "20260610",
+    "mpvRevision": "304426c390901436fb1d4a63efbd582ae80c88f4",
+    "archiveFormat": "7z",
+    "maximumDownloadBytes": 67108864,
+    "assets": {
+      "x86_64": {
+        "url": "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260610/mpv-dev-x86_64-20260610-git-304426c.7z",
+        "sha256": "8cbb25ea784f01afbb3f904217cab1317430a8bcfd5680fd827a866367f71cc9",
+        "library": "libmpv-2.dll"
+      },
+      "aarch64": {
+        "url": "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260610/mpv-dev-aarch64-20260610-git-304426c.7z",
+        "sha256": "d9dd60db1c7b24db2e19d041f70abf0a4995f3e9eadf80a34e54f72300df6ed4",
+        "library": "libmpv-2.dll"
+      }
+    },
+    "notes": "Download only after an explicit local-settings confirmation, verify before extraction, and install atomically below the application data directory."
+  },
+  "linux": {
+    "status": "deferred",
+    "installKind": "systemPackageManager",
+    "notes": "Linux and Flatpak installation are intentionally outside the first implementation milestone."
+  }
+}

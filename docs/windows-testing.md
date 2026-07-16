@@ -1,0 +1,69 @@
+# Windows preview testing
+
+The Windows CI job produces two separate artifacts so the stable application
+and the in-progress MPV adapter do not share a release boundary.
+
+## Normal installer
+
+`heya-windows-x64-installer` is the ordinary MIT build. It includes the Rust
+audio engine and uses CPAL's Windows WASAPI backend. It deliberately has no
+load-time MPV dependency, so it must launch on a clean Windows 10/11 machine
+and retain browser video playback when MPV is unavailable.
+
+Windows processed audio supports:
+
+- Output-device enumeration and selection.
+- Sample-rate conversion to the active WASAPI shared-mode format.
+- ReplayGain, EQ, pre/post gain, limiter, crossfeed, and crossfade.
+- Gapless playback, queue resume, seek, waveform, and FFT visualizers.
+- Real-time/high-priority audio callback scheduling through CPAL.
+
+Bit-perfect playback is not advertised on Windows yet. CPAL's current WASAPI
+output is shared-mode and may invoke the Windows mixer/converter. A future
+WASAPI exclusive adapter must prove exact device format negotiation before the
+setting is enabled.
+
+## Native MPV preview
+
+`heya-windows-x64-native-mpv-preview` is a private development artifact, not a
+production installer. Extract the entire directory and run `Heya.exe` without
+moving the DLL away from it. The directory contains the pinned development
+`libmpv-2.dll`, its provider receipt, and source/provider reference.
+
+The preview exists only to validate the current directly linked MPV adapter on
+real Windows hardware before the user-initiated runtime loader/installer is
+implemented. Do not publish it as a normal HeyaClient release.
+
+## Tester checklist
+
+Record the Windows version, CPU architecture, GPU, driver version, and audio
+devices used. Then verify:
+
+1. Heya opens and can connect to both a normal HTTPS server and a Tailscale
+   server.
+2. `Ctrl+,` opens settings and reports the expected MPV/audio capabilities.
+3. The Output tab lists the system default, HDMI, USB, Bluetooth, and other
+   available endpoints without duplicates or blank labels.
+4. Selecting an endpoint routes the next playback session to it and the choice
+   survives reopening settings.
+5. Music starts, pauses, seeks, resumes after reload, advances, and stops.
+6. EQ, ReplayGain, crossfeed, limiter, gapless playback, and a timed crossfade
+   each work without stutter.
+7. Waveform and FFT visualizers continue updating under native playback.
+8. Changing or disconnecting the active Windows output produces a visible
+   playback error instead of silent, apparently-playing audio. Starting again
+   after selecting a valid device recovers.
+9. The normal installer uses browser video and launches with no MPV files
+   installed.
+10. The native preview reports MPV available and opens video in a separate
+    native window.
+11. MPV play/pause, seek, volume, mute, audio tracks, subtitles, fullscreen,
+    resizing, window close, and replay all work.
+12. The information panel identifies MPV and reports the actual hardware
+    decoder (`d3d11va`, `d3d11va-copy`, or the fallback in use).
+13. Closing MPV does not mark unfinished media complete. Closing Heya,
+    switching servers, logging out, and reloading dispose playback cleanly.
+
+Debug preview logs should be included with any failure report, but playback
+grants, media URLs, cookies, and account credentials must be removed before
+sharing them.

@@ -4,54 +4,238 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#0b0d12" />
-    <title>Heya</title>
-    <style>
-      :root {
-        color-scheme: dark;
-        font-family:
-          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-          "Segoe UI", sans-serif;
-        background: #0b0d12;
-        color: #f7f7f8;
-      }
-
-      * {
-        box-sizing: border-box;
-      }
-
-      body {
-        min-height: 100vh;
-        margin: 0;
-        display: grid;
-        place-items: center;
-        background:
-          radial-gradient(circle at 50% 20%, #22283a 0, transparent 45%),
-          #0b0d12;
-      }
-
-      main {
-        width: min(32rem, calc(100vw - 3rem));
-        text-align: center;
-      }
-
-      h1 {
-        margin: 0;
-        font-size: clamp(3rem, 12vw, 5rem);
-        letter-spacing: -0.08em;
-      }
-
-      p {
-        margin: 1rem 0 0;
-        color: #a9afbd;
-        font-size: 1rem;
-        line-height: 1.6;
-      }
-    </style>
+    <title>Heya Client</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script type="module" src="./main.ts"></script>
   </head>
   <body>
-    <main>
-      <h1>Heya</h1>
-      <p>The native shell is ready. Server connection setup comes next.</p>
+    <main class="shell">
+      <header class="brand" aria-label="Heya">
+        <svg class="brand-mark" aria-hidden="true" viewBox="0 0 22 22">
+          <circle cx="11" cy="11" r="10" fill="none" stroke="currentColor" stroke-width="1.5" />
+          <circle cx="11" cy="11" r="4" fill="currentColor" />
+          <circle cx="11" cy="11" r="1.5" class="brand-center" />
+        </svg>
+        <span class="brand-name">heya<span class="brand-dot">.</span>media</span>
+        <span class="client-label">Native client</span>
+      </header>
+
+      <section class="card" aria-label="Heya client">
+        <div class="card-heading connect-only">
+          <p class="eyebrow">Your media, your server</p>
+          <h2>Connect to Heya</h2>
+          <p class="intro">
+            Enter the address you use to open Heya in a browser. We’ll check
+            the server before opening it here.
+          </p>
+        </div>
+
+        <div class="card-heading settings-only" hidden>
+          <p class="eyebrow">Native client</p>
+          <h2>Client settings</h2>
+          <p class="intro">
+            Choose the Heya server this app opens and manage settings stored
+            only on this device.
+          </p>
+        </div>
+
+        <div id="status" class="status" data-kind="idle" aria-live="polite">
+          <span class="status-indicator" aria-hidden="true"></span>
+          <div>
+            <strong id="status-title">Ready to connect</strong>
+            <p id="status-detail">HTTPS is recommended.</p>
+          </div>
+        </div>
+
+        <form id="server-form" novalidate>
+          <label for="server-origin">Heya server</label>
+          <div class="input-row">
+            <input
+              id="server-origin"
+              name="server-origin"
+              type="url"
+              inputmode="url"
+              autocomplete="url"
+              autocapitalize="none"
+              spellcheck="false"
+              placeholder="https://heya.example.com"
+              required
+            />
+            <button id="connect-button" class="primary-button" type="submit">
+              Connect
+            </button>
+          </div>
+          <p id="http-warning" class="warning" hidden>
+            HTTP is unencrypted. Only use it on a network you trust.
+          </p>
+        </form>
+
+        <div class="settings-only settings-groups" hidden>
+          <section class="settings-group" aria-labelledby="playback-heading">
+            <div>
+              <h3 id="playback-heading">Native playback</h3>
+              <p>
+                Use MPV for native video decoding and rendering when it is
+                available on this device.
+              </p>
+            </div>
+            <div
+              id="native-playback-status"
+              class="native-playback-status"
+              data-available="checking"
+              aria-live="polite"
+            >
+              <span class="native-status-indicator" aria-hidden="true"></span>
+              <span class="native-status-copy">
+                <strong id="native-playback-status-title">Checking for MPV…</strong>
+                <small id="native-playback-status-detail">Testing the native playback backend.</small>
+              </span>
+              <button
+                id="refresh-native-playback-button"
+                class="text-button"
+                type="button"
+              >
+                Check again
+              </button>
+            </div>
+            <label class="toggle-row" for="native-playback-enabled">
+              <span>
+                <strong>Use MPV when available</strong>
+                <small>
+                  Turn this off to keep all video playback in the browser
+                  renderer. Applies to new playback sessions.
+                </small>
+              </span>
+              <span class="switch-control">
+                <input
+                  id="native-playback-enabled"
+                  type="checkbox"
+                  role="switch"
+                  checked
+                />
+                <span class="switch-track" aria-hidden="true"></span>
+              </span>
+            </label>
+          </section>
+
+          <section class="settings-group" aria-labelledby="audio-heading">
+            <div>
+              <h3 id="audio-heading">Native music</h3>
+              <p>
+                Use HeyaClient’s Rust audio engine for gapless playback,
+                crossfade, ReplayGain, equalizer, and visualizers.
+              </p>
+            </div>
+            <div
+              id="native-audio-status"
+              class="native-playback-status"
+              data-available="checking"
+              aria-live="polite"
+            >
+              <span class="native-status-indicator" aria-hidden="true"></span>
+              <span class="native-status-copy">
+                <strong id="native-audio-status-title">Checking native audio…</strong>
+                <small id="native-audio-status-detail">Inspecting the Rust audio backend.</small>
+              </span>
+              <button id="refresh-native-audio-button" class="text-button" type="button">
+                Check again
+              </button>
+            </div>
+            <label class="toggle-row" for="native-audio-enabled">
+              <span>
+                <strong>Use native music playback</strong>
+                <small>
+                  Browser audio remains the fallback if native playback cannot
+                  start. Applies to new playback sessions.
+                </small>
+              </span>
+              <span class="switch-control">
+                <input id="native-audio-enabled" type="checkbox" role="switch" checked />
+                <span class="switch-track" aria-hidden="true"></span>
+              </span>
+            </label>
+            <label class="toggle-row" for="bit-perfect-audio-enabled">
+              <span>
+                <strong>Bit-perfect audio</strong>
+                <small>
+                  Exclusive source-rate output. Disables volume, ReplayGain,
+                  EQ, crossfade, and visualizers while active.
+                </small>
+              </span>
+              <span class="switch-control">
+                <input
+                  id="bit-perfect-audio-enabled"
+                  type="checkbox"
+                  role="switch"
+                  data-available="false"
+                  disabled
+                />
+                <span class="switch-track" aria-hidden="true"></span>
+              </span>
+            </label>
+          </section>
+
+          <section class="settings-group" aria-labelledby="launch-heading">
+            <div>
+              <h3 id="launch-heading">Launch</h3>
+              <p>Control what happens when the native client starts.</p>
+            </div>
+            <label class="toggle-row" for="reconnect-on-launch">
+              <span>
+                <strong>Open saved server on launch</strong>
+                <small>Otherwise, start on the connection screen.</small>
+              </span>
+              <span class="switch-control">
+                <input
+                  id="reconnect-on-launch"
+                  type="checkbox"
+                  role="switch"
+                  checked
+                />
+                <span class="switch-track" aria-hidden="true"></span>
+              </span>
+            </label>
+          </section>
+
+          <section class="settings-group danger-group" aria-labelledby="session-heading">
+            <div>
+              <h3 id="session-heading">Session and local data</h3>
+              <p>
+                Clear Heya’s cookies, cache, and browser storage from this app.
+                This signs the native client out without changing your Heya
+                account.
+              </p>
+            </div>
+            <div class="settings-actions split-actions">
+              <button
+                id="reset-session-button"
+                class="secondary-button"
+                type="button"
+              >
+                Reset login session
+              </button>
+              <button
+                id="forget-settings-button"
+                class="danger-button"
+                type="button"
+              >
+                Forget server
+              </button>
+            </div>
+          </section>
+        </div>
+
+        <div id="saved-actions" class="saved-actions connect-only" hidden>
+          <button id="forget-button" class="text-button" type="button">
+            Forget this server
+          </button>
+        </div>
+      </section>
+
+      <footer>
+        Sign-in happens directly on your Heya server. HeyaClient never stores
+        your Heya password or bearer token in its native settings.
+      </footer>
     </main>
   </body>
 </html>

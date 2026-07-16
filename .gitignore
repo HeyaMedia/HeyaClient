@@ -1,12 +1,15 @@
 # Local project handoff notes
 GET_STARTED.md
+/CAST.md
 
 # JavaScript dependencies
 node_modules/
+bootstrap/dist/
 
 # Rust and Tauri build output
 target/
 src-tauri/target/
+src-tauri/native/mpv/dist/
 
 # Local environment and editor files
 .env
