@@ -53,6 +53,10 @@ tauri-plugin-window-state = "2"
 # device callback thread so UI/WebView activity is less likely to cause an
 # audible deadline miss.
 cpal = { version = "0.18.1", features = ["realtime"] }
+# CPAL 0.18 accepts both windows-core 0.61 and 0.62 independently from its
+# windows crate. Pin the matching generation until CPAL narrows that range;
+# mixing the two makes its COM implementations fail to compile on Windows.
+windows-core = "=0.61.2"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 cpal = "0.18.1"
