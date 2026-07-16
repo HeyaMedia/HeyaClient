@@ -116,7 +116,7 @@ pub async fn check_for_update(
 
 #[tauri::command]
 pub async fn install_update(
-    app: AppHandle,
+    _app: AppHandle,
     invoking_window: WebviewWindow,
     updater: State<'_, AppUpdater>,
     on_event: Channel<UpdateProgress>,
@@ -170,7 +170,7 @@ pub async fn install_update(
     });
 
     #[cfg(not(target_os = "windows"))]
-    app.restart();
+    _app.restart();
 
     #[cfg(target_os = "windows")]
     Ok(())
