@@ -37,6 +37,9 @@ jobs:
       - name: Install JavaScript dependencies
         run: bun install --frozen-lockfile
 
+      - name: Verify release version
+        run: python3 scripts/check-version-sync.py
+
       - name: Check bootstrap types
         run: bun run bootstrap:check
 
@@ -52,20 +55,23 @@ jobs:
       - name: Lint default Rust build
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
 
-      - name: Build unsigned macOS app
-        run: bun tauri build --bundles app --no-sign
+      - name: Build macOS release and signed updater artifact
+        run: bun tauri build --bundles app,dmg
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
 
       - name: Verify MPV is not bundled or linked
         run: python3 scripts/verify-no-bundled-libmpv.py src-tauri/target/release/bundle/macos/Heya.app
 
-      - name: Package unsigned macOS installer
-        run: bun tauri build --bundles dmg --no-sign
-
-      - name: Upload macOS installer
+      - name: Upload macOS release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: heya-macos-arm64-unsigned
-          path: src-tauri/target/release/bundle/dmg/*.dmg
+          name: heya-macos-arm64-release
+          path: |
+            src-tauri/target/release/bundle/dmg/*.dmg
+            src-tauri/target/release/bundle/macos/*.app.tar.gz
+            src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
           if-no-files-found: error
           retention-days: 14
 
@@ -92,6 +98,9 @@ jobs:
       - name: Install JavaScript dependencies
         run: bun install --frozen-lockfile
 
+      - name: Verify release version
+        run: python scripts/check-version-sync.py
+
       - name: Check bootstrap types
         run: bun run bootstrap:check
 
@@ -108,7 +117,10 @@ jobs:
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
 
       - name: Build normal Windows installer
-        run: bun tauri build --bundles nsis --no-sign
+        run: bun tauri build --bundles nsis
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
 
       - name: Verify normal build has no MPV dependency
         run: python scripts/verify-no-bundled-libmpv.py src-tauri/target/release/heya-client.exe
@@ -155,7 +167,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: heya-windows-x64-installer
-          path: src-tauri/target/release/bundle/nsis/*.exe
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/nsis/*.exe.sig
           if-no-files-found: error
           retention-days: 14
 
@@ -166,3 +180,50 @@ jobs:
           path: ${{ runner.temp }}/heya-windows-x64-native-mpv-preview
           if-no-files-found: error
           retention-days: 7
+
+  publish-release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - macos-arm64
+      - windows-x64
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Download macOS release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: heya-macos-arm64-release
+          path: release-assets/macos
+
+      - name: Download Windows release assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4
+        with:
+          name: heya-windows-x64-installer
+          path: release-assets/windows
+
+      - name: Create signed updater manifest
+        run: |
+          python3 scripts/create-updater-manifest.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$GITHUB_REF_NAME" \
+            --macos release-assets/macos \
+            --windows release-assets/windows \
+            --output release-assets/latest.json
+
+      - name: Publish release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
+        with:
+          name: HeyaClient ${{ github.ref_name }}
+          generate_release_notes: true
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/macos/**/*
+            release-assets/windows/**/*
+            release-assets/latest.json

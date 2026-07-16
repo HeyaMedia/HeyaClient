@@ -1,3 +1,5 @@
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+mod app_updates;
 pub mod native_audio;
 mod native_bridge;
 pub mod native_playback;
@@ -189,11 +191,15 @@ pub fn run() {
             save_app_settings,
             connect_to_server,
             forget_server,
-            reset_server_session
+            reset_server_session,
+            app_updates::get_update_status,
+            app_updates::check_for_update,
+            app_updates::install_update,
         ]);
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
     let builder = builder
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(window_state::plugin())
         .on_window_event(window_state::handle_window_event);
 
@@ -244,6 +250,8 @@ pub fn run() {
                 .map_err(|error| std::io::Error::other(format!("Heya setup failed: {error}")))?;
             app.manage(state.clone());
             app.manage(native_bridge::NativeBridgeAcl::default());
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            app.manage(app_updates::AppUpdater::default());
             if let Some(profile) = state.profile() {
                 native_bridge::authorize_origin(app.handle(), &profile.origin)
                     .map_err(std::io::Error::other)?;
@@ -279,6 +287,9 @@ pub fn run() {
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             navigation::install_server_menu(app)?;
+
+            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+            app_updates::check_on_startup(app.handle().clone());
 
             Ok(())
         })

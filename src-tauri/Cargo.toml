@@ -1,6 +1,6 @@
 [package]
 name = "heya-client"
-version = "0.1.0"
+version = "0.2.0"
 description = "Cross-platform native client for Heya"
 authors = ["HeyaMedia"]
 license = "MIT"
@@ -46,6 +46,7 @@ symphonia = { version = "0.5.5", features = ["all"] }
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 libmpv2 = { version = "6.0.0", default-features = false, optional = true }
 libmpv2-sys = { version = "4.0.1", optional = true }
+tauri-plugin-updater = "2.10.1"
 tauri-plugin-window-state = "2"
 
 [target.'cfg(target_os = "windows")'.dependencies]

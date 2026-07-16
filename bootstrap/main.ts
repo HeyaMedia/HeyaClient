@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 
 interface ServerProfile {
   id: string;
@@ -32,6 +32,24 @@ interface NativeAudioStatus {
   bit_perfect_available: boolean;
   bit_perfect_unavailable_reason: string | null;
 }
+
+interface UpdateStatus {
+  currentVersion: string;
+  available: boolean;
+  version: string | null;
+  notes: string | null;
+  publishedAt: string | null;
+}
+
+type UpdateProgress =
+  | { event: "started"; version: string }
+  | {
+      event: "downloading";
+      downloaded_bytes: number;
+      total_bytes: number | null;
+    }
+  | { event: "download_finished" }
+  | { event: "installed"; version: string };
 
 type StatusKind = "idle" | "checking" | "error" | "success";
 
@@ -79,6 +97,23 @@ const nativeAudioStatusDetail = requiredElement<HTMLElement>(
 const refreshNativeAudioButton = requiredElement<HTMLButtonElement>(
   "refresh-native-audio-button",
 );
+const updateStatus = requiredElement<HTMLDivElement>("update-status");
+const updateStatusTitle = requiredElement<HTMLElement>("update-status-title");
+const updateStatusDetail = requiredElement<HTMLElement>("update-status-detail");
+const checkUpdateButton = requiredElement<HTMLButtonElement>(
+  "check-update-button",
+);
+const installUpdateButton = requiredElement<HTMLButtonElement>(
+  "install-update-button",
+);
+const updateActions = requiredElement<HTMLDivElement>("update-actions");
+const updateProgress = requiredElement<HTMLDivElement>("update-progress");
+const updateProgressBar = requiredElement<HTMLProgressElement>(
+  "update-progress-bar",
+);
+const updateProgressLabel = requiredElement<HTMLElement>(
+  "update-progress-label",
+);
 const savedActions = requiredElement<HTMLDivElement>("saved-actions");
 const httpWarning = requiredElement<HTMLParagraphElement>("http-warning");
 const status = requiredElement<HTMLDivElement>("status");
@@ -95,6 +130,7 @@ let appSettings: AppSettings = {
 };
 let busy = false;
 let savingPreferences = false;
+let updateBusy = false;
 const searchParams = new URLSearchParams(window.location.search);
 const isSettingsPage = searchParams.has("settings");
 
@@ -154,6 +190,14 @@ refreshNativeAudioButton.addEventListener("click", () => {
   void refreshNativeAudioStatus();
 });
 
+checkUpdateButton.addEventListener("click", () => {
+  void checkForUpdate();
+});
+
+installUpdateButton.addEventListener("click", () => {
+  void installAvailableUpdate();
+});
+
 void initialize();
 
 async function initialize(): Promise<void> {
@@ -178,6 +222,7 @@ async function initialize(): Promise<void> {
   updateSavedActionAvailability();
   void refreshNativePlaybackStatus();
   void refreshNativeAudioStatus();
+  if (isSettingsPage) void refreshUpdateStatus();
 
   if (!savedProfile) {
     if (isSettingsPage) {
@@ -373,10 +418,115 @@ function setBusy(value: boolean): void {
   setPreferencesSaving(savingPreferences);
   refreshNativePlaybackButton.disabled = value;
   refreshNativeAudioButton.disabled = value;
+  checkUpdateButton.disabled = value || updateBusy;
+  installUpdateButton.disabled = value || updateBusy;
   if (value) connectButton.textContent = "Connecting…";
   else if (connectButton.textContent === "Connecting…") {
     connectButton.textContent = isSettingsPage ? "Save & open" : "Connect";
   }
+}
+
+async function refreshUpdateStatus(): Promise<void> {
+  try {
+    renderUpdateStatus(await invoke<UpdateStatus>("get_update_status"));
+  } catch (error) {
+    updateStatus.dataset.available = "false";
+    updateStatusTitle.textContent = "Couldn’t read update status";
+    updateStatusDetail.textContent = errorMessage(error);
+  }
+}
+
+async function checkForUpdate(): Promise<void> {
+  if (busy || updateBusy) return;
+  setUpdateBusy(true);
+  updateStatus.dataset.available = "checking";
+  updateStatusTitle.textContent = "Checking for updates…";
+  updateStatusDetail.textContent = "Contacting the HeyaClient release feed.";
+  updateActions.hidden = true;
+
+  try {
+    renderUpdateStatus(await invoke<UpdateStatus>("check_for_update"));
+  } catch (error) {
+    updateStatus.dataset.available = "false";
+    updateStatusTitle.textContent = "Couldn’t check for updates";
+    updateStatusDetail.textContent = errorMessage(error);
+  } finally {
+    setUpdateBusy(false);
+  }
+}
+
+async function installAvailableUpdate(): Promise<void> {
+  if (busy || updateBusy) return;
+  setUpdateBusy(true);
+  updateProgress.hidden = false;
+  updateProgressBar.removeAttribute("value");
+  updateProgressLabel.textContent = "Preparing update…";
+
+  const onEvent = new Channel<UpdateProgress>();
+  onEvent.onmessage = (event) => {
+    if (event.event === "started") {
+      updateProgressLabel.textContent = `Downloading Heya ${event.version}…`;
+      return;
+    }
+    if (event.event === "downloading") {
+      if (event.total_bytes && event.total_bytes > 0) {
+        const percent = Math.min(
+          100,
+          Math.round((event.downloaded_bytes / event.total_bytes) * 100),
+        );
+        updateProgressBar.value = percent;
+        updateProgressLabel.textContent = `${percent}% downloaded`;
+      } else {
+        updateProgressBar.removeAttribute("value");
+        updateProgressLabel.textContent = `${formatBytes(event.downloaded_bytes)} downloaded`;
+      }
+      return;
+    }
+    if (event.event === "download_finished") {
+      updateProgressBar.value = 100;
+      updateProgressLabel.textContent = "Installing update…";
+      return;
+    }
+    updateProgressLabel.textContent = `Heya ${event.version} installed. Restarting…`;
+  };
+
+  try {
+    await invoke("install_update", { onEvent });
+  } catch (error) {
+    updateStatus.dataset.available = "false";
+    updateStatusTitle.textContent = "Couldn’t install the update";
+    updateStatusDetail.textContent = errorMessage(error);
+    updateProgress.hidden = true;
+    setUpdateBusy(false);
+  }
+}
+
+function renderUpdateStatus(update: UpdateStatus): void {
+  updateProgress.hidden = true;
+  if (update.available && update.version) {
+    updateStatus.dataset.available = "checking";
+    updateStatusTitle.textContent = `Heya ${update.version} is available`;
+    updateStatusDetail.textContent = `Installed version: ${update.currentVersion}.`;
+    updateActions.hidden = false;
+    installUpdateButton.textContent = `Install Heya ${update.version}`;
+    return;
+  }
+
+  updateStatus.dataset.available = "true";
+  updateStatusTitle.textContent = "HeyaClient is up to date";
+  updateStatusDetail.textContent = `Installed version: ${update.currentVersion}.`;
+  updateActions.hidden = true;
+}
+
+function setUpdateBusy(value: boolean): void {
+  updateBusy = value;
+  checkUpdateButton.disabled = busy || value;
+  installUpdateButton.disabled = busy || value;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KiB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 async function refreshNativeAudioStatus(): Promise<void> {

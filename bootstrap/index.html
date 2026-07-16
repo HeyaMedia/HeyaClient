@@ -175,6 +175,40 @@
             </label>
           </section>
 
+          <section class="settings-group" aria-labelledby="updates-heading">
+            <div>
+              <h3 id="updates-heading">Updates</h3>
+              <p>
+                Signed HeyaClient releases are checked automatically when the
+                app starts. Installation always waits for your approval.
+              </p>
+            </div>
+            <div
+              id="update-status"
+              class="native-playback-status"
+              data-available="checking"
+              aria-live="polite"
+            >
+              <span class="native-status-indicator" aria-hidden="true"></span>
+              <span class="native-status-copy">
+                <strong id="update-status-title">Reading update status…</strong>
+                <small id="update-status-detail">Checking the installed version.</small>
+              </span>
+              <button id="check-update-button" class="text-button" type="button">
+                Check now
+              </button>
+            </div>
+            <div id="update-progress" class="update-progress" hidden>
+              <progress id="update-progress-bar" max="100"></progress>
+              <span id="update-progress-label">Preparing update…</span>
+            </div>
+            <div id="update-actions" class="settings-actions" hidden>
+              <button id="install-update-button" class="secondary-button" type="button">
+                Install update
+              </button>
+            </div>
+          </section>
+
           <section class="settings-group" aria-labelledby="launch-heading">
             <div>
               <h3 id="launch-heading">Launch</h3>

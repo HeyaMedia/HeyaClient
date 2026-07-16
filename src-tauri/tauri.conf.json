@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Heya",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "media.heya.client",
   "build": {
     "beforeDevCommand": "bun run bootstrap:build",
@@ -30,6 +30,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -37,8 +38,22 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "macOS": {
+      "signingIdentity": "-"
+    },
     "android": {
       "debugApplicationIdSuffix": ".debug"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEQ5MjZFRjkxNUI1QjIyOUEKUldTYUlsdGJrZThtMmJ4c2R2K0dEblVNVXZPbFBhc3liVUpld2x0MXhUeW1CWnBrSFR0UmR2b0QK",
+      "endpoints": [
+        "https://github.com/HeyaMedia/HeyaClient/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
     }
   }
 }

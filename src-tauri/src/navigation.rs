@@ -254,6 +254,12 @@ fn is_bootstrap_url(url: &Url, dev_url: Option<&Url>) -> bool {
         || dev_url.is_some_and(|dev_url| same_origin(dev_url, url))
 }
 
+pub fn is_bootstrap_window(window: &WebviewWindow) -> bool {
+    window.url().is_ok_and(|url| {
+        is_bootstrap_url(&url, window.app_handle().config().build.dev_url.as_ref())
+    })
+}
+
 fn bootstrap_url(dev_url: Option<&Url>, query: &str) -> Url {
     let mut url = dev_url.cloned().unwrap_or_else(|| {
         if cfg!(any(target_os = "windows", target_os = "android")) {
