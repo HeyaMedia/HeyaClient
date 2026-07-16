@@ -6,6 +6,7 @@ pub mod native_playback;
 mod native_window;
 mod navigation;
 mod server_profile;
+pub mod system_media;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 mod window_state;
 
@@ -119,6 +120,7 @@ async fn connect_to_server(
     state: State<'_, AppState>,
     playback: State<'_, native_playback::NativePlaybackManager>,
     audio: State<'_, native_audio::NativeAudioManager>,
+    system_media: State<'_, system_media::SystemMediaManager>,
 ) -> Result<ServerProfile, String> {
     let previous = state.profile();
     let profile = state.validate_and_store(&origin).await?;
@@ -130,6 +132,7 @@ async fn connect_to_server(
         audio
             .dispose_active(native_playback::TerminationReason::ServerSwitched)
             .map_err(|error| error.message)?;
+        system_media.clear_all();
     }
     navigation::navigate_main_to_server(&app, &profile)?;
     close_settings_window(&invoking_window)?;
@@ -143,6 +146,7 @@ fn forget_server(
     state: State<'_, AppState>,
     playback: State<'_, native_playback::NativePlaybackManager>,
     audio: State<'_, native_audio::NativeAudioManager>,
+    system_media: State<'_, system_media::SystemMediaManager>,
 ) -> Result<(), String> {
     playback
         .dispose_active(native_playback::TerminationReason::ServerSwitched)
@@ -150,6 +154,7 @@ fn forget_server(
     audio
         .dispose_active(native_playback::TerminationReason::ServerSwitched)
         .map_err(|error| error.message)?;
+    system_media.clear_all();
     navigation::main_window(&app)?
         .clear_all_browsing_data()
         .map_err(|error| format!("could not clear the Heya WebView session: {error}"))?;
@@ -165,6 +170,7 @@ fn reset_server_session(
     state: State<'_, AppState>,
     playback: State<'_, native_playback::NativePlaybackManager>,
     audio: State<'_, native_audio::NativeAudioManager>,
+    system_media: State<'_, system_media::SystemMediaManager>,
 ) -> Result<(), String> {
     playback
         .dispose_active(native_playback::TerminationReason::LoggedOut)
@@ -172,6 +178,7 @@ fn reset_server_session(
     audio
         .dispose_active(native_playback::TerminationReason::LoggedOut)
         .map_err(|error| error.message)?;
+    system_media.clear_all();
     let profile = state
         .profile()
         .ok_or_else(|| "Choose a Heya server before resetting its session.".to_string())?;
@@ -207,6 +214,8 @@ pub fn run() {
         )
         .plugin(native_playback::lifecycle_plugin())
         .plugin(native_audio::audio_lifecycle_plugin())
+        .plugin(system_media::system_media_lifecycle_plugin())
+        .plugin(tauri_plugin_notification::init())
         .plugin(native_bridge::plugin())
         .invoke_handler(tauri::generate_handler![
             get_server_profile,
@@ -236,6 +245,9 @@ pub fn run() {
             navigation::SETTINGS_MENU_ID | navigation::SWITCH_SERVER_MENU_ID
         ) {
             navigation::request_settings(app);
+        } else if let Some(command) = system_media::menu_command(event.id().as_ref()) {
+            app.state::<system_media::SystemMediaManager>()
+                .dispatch_menu_command(command);
         } else {
             #[cfg(all(debug_assertions, feature = "native-mpv"))]
             if event.id().as_ref() == native_playback::NATIVE_MPV_SPIKE_MENU_ID {
@@ -312,7 +324,14 @@ pub fn run() {
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             window_state::install(app)?;
 
-            navigation::create_main_window(app, state, playback)?;
+            let main_window = navigation::create_main_window(app, state, playback)?;
+            let system_media_cache = app.path().app_cache_dir()?;
+            let system_media = system_media::SystemMediaManager::new(
+                app.handle().clone(),
+                &main_window,
+                system_media_cache,
+            );
+            app.manage(system_media);
 
             #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
             window_state::save_now(app.handle());

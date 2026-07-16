@@ -15,6 +15,7 @@ interface AppSettings {
   native_audio_enabled: boolean;
   bit_perfect_audio_enabled: boolean;
   audio_output_device_id: string | null;
+  track_change_notifications: boolean;
 }
 
 interface NativePlaybackStatus {
@@ -98,6 +99,9 @@ const nativeAudioEnabled = requiredElement<HTMLInputElement>(
 const bitPerfectAudioEnabled = requiredElement<HTMLInputElement>(
   "bit-perfect-audio-enabled",
 );
+const trackChangeNotifications = requiredElement<HTMLInputElement>(
+  "track-change-notifications",
+);
 const nativePlaybackStatus = requiredElement<HTMLDivElement>(
   "native-playback-status",
 );
@@ -164,6 +168,7 @@ let appSettings: AppSettings = {
   native_audio_enabled: true,
   bit_perfect_audio_enabled: false,
   audio_output_device_id: null,
+  track_change_notifications: false,
 };
 let busy = false;
 let savingPreferences = false;
@@ -241,6 +246,10 @@ bitPerfectAudioEnabled.addEventListener("change", () => {
   void savePreferences();
 });
 
+trackChangeNotifications.addEventListener("change", () => {
+  void savePreferences();
+});
+
 refreshNativePlaybackButton.addEventListener("click", () => {
   void refreshNativePlaybackStatus();
 });
@@ -282,6 +291,7 @@ async function initialize(): Promise<void> {
   nativePlaybackEnabled.checked = appSettings.native_playback_enabled;
   nativeAudioEnabled.checked = appSettings.native_audio_enabled;
   bitPerfectAudioEnabled.checked = appSettings.bit_perfect_audio_enabled;
+  trackChangeNotifications.checked = appSettings.track_change_notifications;
   updateSavedActionAvailability();
   void refreshNativePlaybackStatus();
   void refreshNativeAudioStatus();
@@ -427,6 +437,7 @@ async function savePreferences(showConfirmation = true): Promise<boolean> {
     native_audio_enabled: nativeAudioEnabled.checked,
     bit_perfect_audio_enabled: bitPerfectAudioEnabled.checked,
     audio_output_device_id: appSettings.audio_output_device_id,
+    track_change_notifications: trackChangeNotifications.checked,
   };
   setPreferencesSaving(true);
   try {
@@ -443,10 +454,13 @@ async function savePreferences(showConfirmation = true): Promise<boolean> {
       const audioDetail = appSettings.native_audio_enabled
         ? "Music will prefer the native Rust engine."
         : "Music will use browser playback.";
+      const notificationDetail = appSettings.track_change_notifications
+        ? "Track-change notifications are enabled while HeyaClient is in the background."
+        : "Track-change notifications are disabled.";
       setStatus(
         "success",
         "Preferences saved",
-        `${launchDetail} ${playbackDetail} ${audioDetail}`,
+        `${launchDetail} ${playbackDetail} ${audioDetail} ${notificationDetail}`,
       );
     }
     return true;
@@ -455,6 +469,7 @@ async function savePreferences(showConfirmation = true): Promise<boolean> {
     nativePlaybackEnabled.checked = previousSettings.native_playback_enabled;
     nativeAudioEnabled.checked = previousSettings.native_audio_enabled;
     bitPerfectAudioEnabled.checked = previousSettings.bit_perfect_audio_enabled;
+    trackChangeNotifications.checked = previousSettings.track_change_notifications;
     setStatus("error", "Couldn’t save the preference", errorMessage(error));
     return false;
   } finally {
@@ -469,6 +484,7 @@ function setPreferencesSaving(value: boolean): void {
   nativePlaybackEnabled.disabled = disabled;
   nativeAudioEnabled.disabled = disabled;
   bitPerfectAudioEnabled.disabled = disabled || bitPerfectAudioEnabled.dataset.available !== "true";
+  trackChangeNotifications.disabled = disabled;
 }
 
 function setBusy(value: boolean): void {

@@ -1,6 +1,6 @@
 [package]
 name = "heya-client"
-version = "0.2.3"
+version = "0.2.5"
 description = "Cross-platform native client for Heya"
 authors = ["HeyaMedia"]
 license = "MIT"
@@ -29,14 +29,17 @@ tauri-build = { version = "2.6.3", features = [] }
 chrono = { version = "0.4.45", features = ["serde"] }
 log = "0.4"
 anyhow = "1.0"
+base64 = "0.22.1"
 crossbeam-channel = "0.5"
 realfft = "3.5"
 reqwest = { version = "0.13.4", default-features = false, features = ["blocking", "json", "rustls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+souvlaki = "0.8.3"
 tauri = { version = "2.11.3", features = ["macos-private-api"] }
 tauri-plugin-log = "2"
 tauri-plugin-opener = "2.5.4"
+tauri-plugin-notification = "2.3.3"
 uuid = { version = "1.18.1", features = ["serde", "v4"] }
 tracing = "0.1"
 symphonia = { version = "0.5.5", features = ["all"] }

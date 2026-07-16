@@ -4,7 +4,9 @@
 //! JavaScript bridge objects call only the semantic commands registered here, and
 //! Rust validates the selected server origin plus every operation payload.
 
-use crate::{native_audio, native_playback, navigation, server_profile::normalize_origin};
+use crate::{
+    native_audio, native_playback, navigation, server_profile::normalize_origin, system_media,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -19,11 +21,13 @@ use tauri::{
 pub const PLUGIN_NAME: &str = "native-bridge";
 pub const AUDIO_COMMAND: &str = "plugin:native-bridge|native_audio_request";
 pub const PLAYBACK_COMMAND: &str = "plugin:native-bridge|native_playback_request";
+pub const SYSTEM_MEDIA_COMMAND: &str = "plugin:native-bridge|system_media_request";
 pub const WINDOW_COMMAND: &str = "plugin:native-bridge|native_window_request";
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 const AUDIO_PERMISSION: &str = "native-bridge:allow-native-audio-request";
 const PLAYBACK_PERMISSION: &str = "native-bridge:allow-native-playback-request";
+const SYSTEM_MEDIA_PERMISSION: &str = "native-bridge:allow-system-media-request";
 const WINDOW_PERMISSION: &str = "native-bridge:allow-native-window-request";
 #[cfg(not(target_os = "macos"))]
 const START_DRAGGING_PERMISSION: &str = "core:window:allow-start-dragging";
@@ -41,8 +45,16 @@ pub struct NativeBridgeRequest {
 
 impl NativeBridgeRequest {
     pub fn ensure_size(&self, kind: &str) -> Result<(), native_playback::BridgeError> {
+        self.ensure_size_with_limit(kind, MAX_REQUEST_BYTES)
+    }
+
+    pub fn ensure_size_with_limit(
+        &self,
+        kind: &str,
+        limit: usize,
+    ) -> Result<(), native_playback::BridgeError> {
         let within_limit = serde_json::to_vec(self)
-            .map(|encoded| encoded.len() <= MAX_REQUEST_BYTES)
+            .map(|encoded| encoded.len() <= limit)
             .unwrap_or(false);
         if within_limit {
             Ok(())
@@ -64,6 +76,7 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
         .invoke_handler(tauri::generate_handler![
             native_audio_request,
             native_playback_request,
+            system_media_request,
             native_window_request
         ])
         .build()
@@ -111,6 +124,15 @@ fn native_window_request<R: Runtime>(
     crate::native_window::handle_window_ipc(&app, &webview, request)
 }
 
+#[tauri::command]
+fn system_media_request<R: Runtime>(
+    app: AppHandle<R>,
+    webview: WebviewWindow<R>,
+    request: NativeBridgeRequest,
+) -> native_playback::BridgeResponse<Value> {
+    system_media::handle_system_media_ipc(&app, &webview, request)
+}
+
 /// Authorize only the selected Heya origin to call the semantic bridge
 /// commands. Previously authorized origins remain harmless after a server
 /// switch: top-level navigation rejects them and each command independently
@@ -137,6 +159,7 @@ pub fn authorize_origin<R: Runtime>(app: &AppHandle<R>, origin: &str) -> Result<
         .window(navigation::MAIN_WINDOW_LABEL)
         .permission(AUDIO_PERMISSION)
         .permission(PLAYBACK_PERMISSION)
+        .permission(SYSTEM_MEDIA_PERMISSION)
         .permission(WINDOW_PERMISSION);
 
     #[cfg(not(target_os = "macos"))]

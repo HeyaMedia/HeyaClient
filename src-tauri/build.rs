@@ -32,6 +32,7 @@ fn main() {
         tauri_build::InlinedPlugin::new().commands(&[
             "native_audio_request",
             "native_playback_request",
+            "system_media_request",
             "native_window_request",
         ]),
     );

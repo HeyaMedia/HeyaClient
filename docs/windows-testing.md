@@ -50,6 +50,13 @@ devices used. Then verify:
     decoder (`d3d11va`, `d3d11va-copy`, or the fallback in use).
 13. Closing MPV does not mark unfinished media complete. Closing Heya,
     switching servers, logging out, and reloading dispose playback cleanly.
+14. The Windows media flyout shows title, artist, album, artwork, duration, and
+    the correct playing state for both browser and native Rust audio output.
+15. Hardware play/pause, previous, next, and seek commands operate the Heya
+    queue while HeyaClient is focused and while another app is focused.
+16. Enabling track-change notifications in local settings shows one
+    notification after a real background track change, but none while the
+    HeyaClient window is focused or when metadata refreshes in place.
 
 Debug logs should be included with any failure report, but playback
 grants, media URLs, cookies, and account credentials must be removed before

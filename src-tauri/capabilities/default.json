@@ -14,6 +14,7 @@
     "core:window:allow-toggle-maximize",
     "native-bridge:allow-native-audio-request",
     "native-bridge:allow-native-playback-request",
+    "native-bridge:allow-system-media-request",
     "native-bridge:allow-native-window-request"
   ]
 }

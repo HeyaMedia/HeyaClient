@@ -4,7 +4,8 @@ The native desktop client for [Heya](https://github.com/HeyaMedia/Heya).
 
 It wraps your own Heya server in a Tauri app and adds the native bits that are
 hard to do well in a browser: Rust-powered music playback, optional MPV video,
-native settings, remembered windows, and automatic updates.
+OS Now Playing and media-key controls, native settings, remembered windows,
+and automatic updates.
 
 It is still young, but it already plays music and video rather nicely.
 
@@ -37,6 +38,10 @@ Tagged releases build macOS ARM64 and Windows x64 installers. HeyaClient checks
 GitHub Releases for signed updates and asks before installing one.
 
 Release details live in [docs/releases.md](docs/releases.md).
+
+The native integration contracts are documented under
+[native audio](docs/native-audio.md), [native playback](docs/native-playback.md),
+and [system media](docs/system-media.md).
 
 ## License
 

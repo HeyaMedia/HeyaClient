@@ -119,16 +119,17 @@ pub fn create_main_window(
 }
 
 fn native_initialization_script() -> String {
-    // Both bridge sources are IIFEs. A bare newline is not a JavaScript
-    // statement boundary: without this semicolon WebKit parses the second
-    // IIFE as a call on the first one's return value, so only video starts.
+    // Every bridge source is an IIFE. Bare newlines are not JavaScript
+    // statement boundaries, so keep explicit semicolons between them.
     let playback = crate::native_playback::initialization_script();
     let audio = crate::native_audio::audio_initialization_script();
+    let system_media = crate::system_media::system_media_initialization_script();
     let window = crate::native_window::initialization_script();
     format!(
-        "{};\n{};\n{}",
+        "{};\n{};\n{};\n{}",
         playback.trim_end(),
         audio.trim(),
+        system_media.trim(),
         window.trim_start()
     )
 }
@@ -236,6 +237,22 @@ fn create_settings_window(app: &AppHandle) -> Result<WebviewWindow, String> {
 pub fn install_server_menu(app: &mut App) -> tauri::Result<()> {
     use tauri::menu::{Menu, MenuItemBuilder, SubmenuBuilder};
 
+    let play_pause =
+        MenuItemBuilder::with_id(crate::system_media::PLAY_PAUSE_MENU_ID, "Play/Pause")
+            .accelerator("CmdOrCtrl+Shift+Space")
+            .build(app)?;
+    let previous = MenuItemBuilder::with_id(crate::system_media::PREVIOUS_MENU_ID, "Previous")
+        .accelerator("CmdOrCtrl+Shift+Left")
+        .build(app)?;
+    let next = MenuItemBuilder::with_id(crate::system_media::NEXT_MENU_ID, "Next")
+        .accelerator("CmdOrCtrl+Shift+Right")
+        .build(app)?;
+    let playback_menu = SubmenuBuilder::new(app, "Playback")
+        .item(&play_pause)
+        .item(&previous)
+        .item(&next)
+        .build()?;
+
     let settings = MenuItemBuilder::with_id(SETTINGS_MENU_ID, "Settings…")
         .accelerator("CmdOrCtrl+,")
         .build(app)?;
@@ -270,6 +287,7 @@ pub fn install_server_menu(app: &mut App) -> tauri::Result<()> {
     }
 
     let menu = Menu::default(app.handle())?;
+    menu.append(&playback_menu)?;
     menu.append(&server_menu)?;
     app.set_menu(menu)?;
     Ok(())
@@ -347,8 +365,10 @@ mod tests {
         assert!(script.contains("})();\n(() => {"));
         assert!(script.contains("__HEYA_NATIVE_PLAYBACK__"));
         assert!(script.contains("__HEYA_NATIVE_AUDIO__"));
+        assert!(script.contains("__HEYA_SYSTEM_MEDIA__"));
         assert!(script.contains("plugin:native-bridge|native_audio_request"));
         assert!(script.contains("plugin:native-bridge|native_playback_request"));
+        assert!(script.contains("plugin:native-bridge|system_media_request"));
         assert!(!script.contains("heya-native-audio://"));
         assert!(!script.contains("heya-native-playback://"));
     }
