@@ -64,6 +64,105 @@ button {
   -webkit-tap-highlight-color: transparent;
 }
 
+.window-chrome {
+  position: fixed;
+  inset: 0 0 auto;
+  height: 34px;
+  z-index: 1000;
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.window-drag-region {
+  position: absolute;
+  inset: 0;
+  pointer-events: auto;
+}
+
+.window-controls {
+  position: absolute;
+  top: 0;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  pointer-events: auto;
+}
+
+[data-platform="macos"] .window-controls {
+  left: 13px;
+}
+
+[data-platform="windows"] .window-controls,
+[data-platform="linux"] .window-controls {
+  right: 0;
+  height: 32px;
+  gap: 0;
+}
+
+.window-control {
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 13px;
+  height: 13px;
+  border: 0;
+  border-radius: 50%;
+  padding: 0;
+}
+
+.window-control svg {
+  width: 8px;
+  height: 8px;
+  fill: none;
+  stroke: rgb(24 24 28 / 78%);
+  stroke-linecap: round;
+  stroke-width: 1.35;
+  opacity: 0;
+}
+
+[data-platform="macos"] .window-controls:hover svg,
+[data-platform="macos"] .window-control:focus-visible svg {
+  opacity: 1;
+}
+
+[data-platform="macos"] .window-close { background: #ff5f57; }
+[data-platform="macos"] .window-minimize { background: #febc2e; }
+[data-platform="macos"] .window-maximize { background: #28c840; }
+
+[data-platform="windows"] .window-control,
+[data-platform="linux"] .window-control {
+  width: 46px;
+  height: 32px;
+  border-radius: 0;
+  background: transparent;
+  transition: background 120ms ease;
+}
+
+[data-platform="windows"] .window-control svg,
+[data-platform="linux"] .window-control svg {
+  width: 10px;
+  height: 10px;
+  stroke: var(--fg-1);
+  opacity: 1;
+}
+
+[data-platform="windows"] .window-control:hover,
+[data-platform="linux"] .window-control:hover {
+  background: rgb(255 255 255 / 10%);
+}
+
+[data-platform="windows"] .window-close:hover,
+[data-platform="linux"] .window-close:hover {
+  background: #c42b1c;
+}
+
+[data-platform="windows"] .window-controls,
+[data-platform="linux"] .window-controls {
+  flex-direction: row-reverse;
+}
+
 .shell {
   width: min(34rem, calc(100vw - 3rem));
   min-height: 100vh;

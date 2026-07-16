@@ -1,4 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 interface ServerProfile {
   id: string;
@@ -150,6 +151,11 @@ const httpWarning = requiredElement<HTMLParagraphElement>("http-warning");
 const status = requiredElement<HTMLDivElement>("status");
 const statusTitle = requiredElement<HTMLElement>("status-title");
 const statusDetail = requiredElement<HTMLParagraphElement>("status-detail");
+const windowChrome = requiredElement<HTMLDivElement>("window-chrome");
+const windowDragRegion = requiredElement<HTMLDivElement>("window-drag-region");
+const windowClose = requiredElement<HTMLButtonElement>("window-close");
+const windowMinimize = requiredElement<HTMLButtonElement>("window-minimize");
+const windowMaximize = requiredElement<HTMLButtonElement>("window-maximize");
 
 let savedProfile: ServerProfile | null = null;
 let appSettings: AppSettings = {
@@ -164,14 +170,36 @@ let savingPreferences = false;
 let updateBusy = false;
 const searchParams = new URLSearchParams(window.location.search);
 const isSettingsPage = searchParams.has("settings");
+const platform = navigator.userAgent.includes("Windows")
+  ? "windows"
+  : navigator.userAgent.includes("Mac")
+    ? "macos"
+    : "linux";
+const usesCustomWindowChrome = !isSettingsPage && platform !== "macos";
 
 document.body.dataset.page = isSettingsPage ? "settings" : "connect";
+document.documentElement.dataset.windowChrome = usesCustomWindowChrome ? "custom" : "native";
+document.body.dataset.platform = platform;
+windowChrome.hidden = !usesCustomWindowChrome;
 document.querySelectorAll<HTMLElement>(".connect-only").forEach((element) => {
   element.hidden = isSettingsPage;
 });
 document.querySelectorAll<HTMLElement>(".settings-only").forEach((element) => {
   element.hidden = !isSettingsPage;
 });
+
+if (usesCustomWindowChrome) {
+  const appWindow = getCurrentWindow();
+  windowDragRegion.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    if (event.detail === 2) void appWindow.toggleMaximize();
+    else void appWindow.startDragging();
+  });
+  windowClose.addEventListener("click", () => void appWindow.close());
+  windowMinimize.addEventListener("click", () => void appWindow.minimize());
+  windowMaximize.addEventListener("click", () => void appWindow.toggleMaximize());
+}
 
 form.addEventListener("submit", (event) => {
   event.preventDefault();

@@ -1,7 +1,7 @@
 //! Narrow IPC transport shared by Heya's native audio and video bridges.
 //!
 //! The remote page never receives a generic application API. Its frozen
-//! JavaScript bridge objects call only the two commands registered here, and
+//! JavaScript bridge objects call only the semantic commands registered here, and
 //! Rust validates the selected server origin plus every operation payload.
 
 use crate::{native_audio, native_playback, navigation, server_profile::normalize_origin};
@@ -19,10 +19,16 @@ use tauri::{
 pub const PLUGIN_NAME: &str = "native-bridge";
 pub const AUDIO_COMMAND: &str = "plugin:native-bridge|native_audio_request";
 pub const PLAYBACK_COMMAND: &str = "plugin:native-bridge|native_playback_request";
+pub const WINDOW_COMMAND: &str = "plugin:native-bridge|native_window_request";
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 const AUDIO_PERMISSION: &str = "native-bridge:allow-native-audio-request";
 const PLAYBACK_PERMISSION: &str = "native-bridge:allow-native-playback-request";
+const WINDOW_PERMISSION: &str = "native-bridge:allow-native-window-request";
+#[cfg(not(target_os = "macos"))]
+const START_DRAGGING_PERMISSION: &str = "core:window:allow-start-dragging";
+#[cfg(not(target_os = "macos"))]
+const INTERNAL_TOGGLE_MAXIMIZE_PERMISSION: &str = "core:window:allow-internal-toggle-maximize";
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -57,7 +63,8 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     tauri::plugin::Builder::new(PLUGIN_NAME)
         .invoke_handler(tauri::generate_handler![
             native_audio_request,
-            native_playback_request
+            native_playback_request,
+            native_window_request
         ])
         .build()
 }
@@ -80,7 +87,16 @@ fn native_playback_request<R: Runtime>(
     native_playback::handle_playback_ipc(&app, &webview, request)
 }
 
-/// Authorize only the selected Heya origin to call the two semantic bridge
+#[tauri::command]
+fn native_window_request<R: Runtime>(
+    app: AppHandle<R>,
+    webview: WebviewWindow<R>,
+    request: NativeBridgeRequest,
+) -> native_playback::BridgeResponse<Value> {
+    crate::native_window::handle_window_ipc(&app, &webview, request)
+}
+
+/// Authorize only the selected Heya origin to call the semantic bridge
 /// commands. Previously authorized origins remain harmless after a server
 /// switch: top-level navigation rejects them and each command independently
 /// verifies the currently selected origin before dispatch.
@@ -100,14 +116,23 @@ pub fn authorize_origin<R: Runtime>(app: &AppHandle<R>, origin: &str) -> Result<
         }
     }
 
-    let result = app.add_capability(
-        CapabilityBuilder::new(capability_identifier(&origin))
-            .remote(remote_pattern(&origin))
-            .local(false)
-            .window(navigation::MAIN_WINDOW_LABEL)
-            .permission(AUDIO_PERMISSION)
-            .permission(PLAYBACK_PERMISSION),
-    );
+    let capability = CapabilityBuilder::new(capability_identifier(&origin))
+        .remote(remote_pattern(&origin))
+        .local(false)
+        .window(navigation::MAIN_WINDOW_LABEL)
+        .permission(AUDIO_PERMISSION)
+        .permission(PLAYBACK_PERMISSION)
+        .permission(WINDOW_PERMISSION);
+
+    #[cfg(not(target_os = "macos"))]
+    let capability = capability
+        // Windows and Linux still use Heya's custom titlebar. macOS keeps a
+        // real AppKit titlebar, so it must never take the delayed IPC drag
+        // path.
+        .permission(START_DRAGGING_PERMISSION)
+        .permission(INTERNAL_TOGGLE_MAXIMIZE_PERMISSION);
+
+    let result = app.add_capability(capability);
     if let Err(error) = result {
         if let Ok(mut origins) = acl.origins.lock() {
             origins.remove(&origin);

@@ -8,7 +8,12 @@
   ],
   "permissions": [
     "core:default",
+    "core:window:allow-close",
+    "core:window:allow-minimize",
+    "core:window:allow-start-dragging",
+    "core:window:allow-toggle-maximize",
     "native-bridge:allow-native-audio-request",
-    "native-bridge:allow-native-playback-request"
+    "native-bridge:allow-native-playback-request",
+    "native-bridge:allow-native-window-request"
   ]
 }

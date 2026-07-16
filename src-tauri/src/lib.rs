@@ -3,6 +3,7 @@ mod app_updates;
 pub mod native_audio;
 mod native_bridge;
 pub mod native_playback;
+mod native_window;
 mod navigation;
 mod server_profile;
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]

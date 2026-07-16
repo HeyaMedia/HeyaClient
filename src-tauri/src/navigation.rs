@@ -1,6 +1,4 @@
 use crate::server_profile::{same_origin, AppState, ServerProfile};
-#[cfg(all(feature = "native-mpv", target_os = "macos"))]
-use objc2_app_kit::NSWindow;
 use tauri::{
     webview::NewWindowResponse, App, AppHandle, Manager, Url, WebviewUrl, WebviewWindow,
     WebviewWindowBuilder,
@@ -39,7 +37,7 @@ pub fn create_main_window(
 
     let initialization_script = native_initialization_script();
 
-    let window = WebviewWindowBuilder::from_config(app, &config)?
+    let builder = WebviewWindowBuilder::from_config(app, &config)?
         // The remote page remains visually opaque during normal browsing.
         // Transparency is used only by Heya's full-window native-player route
         // so the origin-validated MPV surface beneath WKWebView can show.
@@ -60,6 +58,19 @@ pub fn create_main_window(
             );
 
             if is_bootstrap || is_selected_server {
+                #[cfg(target_os = "macos")]
+                if let Some(window) =
+                    navigation_app.get_webview_window(MAIN_WINDOW_LABEL)
+                {
+                    if let Err(error) =
+                        crate::native_window::set_native_controls_visible(&window, true)
+                    {
+                        log::warn!(
+                            "could not restore native window controls before navigation: {}",
+                            error.message
+                        );
+                    }
+                }
                 if let Err(error) =
                     navigation_playback.dispose_active(crate::native_playback::TerminationReason::Disposed)
                 {
@@ -79,19 +90,29 @@ pub fn create_main_window(
         .on_new_window(move |url, _features| {
             open_external(&new_window_app, &url);
             NewWindowResponse::Deny
-        })
-        .build()?;
+        });
 
-    #[cfg(all(feature = "native-mpv", target_os = "macos"))]
-    match window.ns_window() {
-        Ok(handle) if !handle.is_null() => unsafe {
-            // Receive mouse-move tracking even while Heya is not the key
-            // window, so hovering the player can reveal its controls before
-            // the user clicks to activate it.
-            (&*(handle as *const NSWindow)).setAcceptsMouseMovedEvents(true);
-        },
-        Ok(_) => log::warn!("the Heya window returned an invalid AppKit handle"),
-        Err(error) => log::warn!("could not enable inactive player hover tracking: {error}"),
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        // Keep the real AppKit titlebar while allowing Heya's topbar to paint
+        // beneath its transparent overlay. A native gesture monitor is added
+        // after construction so the entire Heya navbar can drag without
+        // swallowing ordinary clicks on its controls. Native traffic lights
+        // also restore the system's inactive-window, accessibility, shadow
+        // and corner behaviour.
+        .decorations(true)
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(tauri::LogicalPosition::new(16.0, 20.0));
+
+    let window = builder.build()?;
+
+    #[cfg(target_os = "macos")]
+    if let Err(error) = crate::native_window::configure_native_main_window(&window) {
+        log::warn!(
+            "could not configure native macOS window chrome: {}",
+            error.message
+        );
     }
 
     Ok(window)
@@ -103,7 +124,13 @@ fn native_initialization_script() -> String {
     // IIFE as a call on the first one's return value, so only video starts.
     let playback = crate::native_playback::initialization_script();
     let audio = crate::native_audio::audio_initialization_script();
-    format!("{};\n{}", playback.trim_end(), audio.trim_start())
+    let window = crate::native_window::initialization_script();
+    format!(
+        "{};\n{};\n{}",
+        playback.trim_end(),
+        audio.trim(),
+        window.trim_start()
+    )
 }
 
 pub fn navigate_to_server(window: &WebviewWindow, profile: &ServerProfile) -> Result<(), String> {

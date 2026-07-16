@@ -1682,6 +1682,7 @@ name = "heya-client"
 version = "0.2.2"
 dependencies = [
  "anyhow",
+ "block2",
  "cc",
  "chrono",
  "coreaudio-rs",
