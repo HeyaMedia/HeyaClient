@@ -13,7 +13,7 @@ use libmpv2::{
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tauri::AppHandle;
@@ -44,12 +44,18 @@ impl MpvEngineFactory {
 
 impl PlaybackEngineFactory for MpvEngineFactory {
     fn capabilities(&self) -> PlaybackCapabilities {
-        static PROBE: OnceLock<Result<(), ()>> = OnceLock::new();
-        let available = PROBE
-            .get_or_init(|| {
-                probe_libmpv().map_err(|error| log::warn!("libmpv probe failed: {error}"))
-            })
-            .is_ok();
+        static AVAILABLE: AtomicBool = AtomicBool::new(false);
+        let available = AVAILABLE.load(Ordering::Acquire)
+            || match probe_libmpv() {
+                Ok(()) => {
+                    AVAILABLE.store(true, Ordering::Release);
+                    true
+                }
+                Err(error) => {
+                    log::warn!("libmpv probe failed: {error}");
+                    false
+                }
+            };
         PlaybackCapabilities::mpv(
             available,
             if cfg!(target_os = "macos") {
@@ -700,6 +706,16 @@ fn create_mpv(output: MpvOutput) -> Result<Mpv, EngineError> {
     Mpv::with_initializer(|initializer| {
         initializer.set_option("config", false)?;
         initializer.set_option("load-scripts", false)?;
+        // MPV 0.41 ships several built-in Lua scripts with independent load
+        // switches. Heya owns its controls and diagnostics, so none are
+        // needed; disabling them also keeps LuaJIT-generated executable pages
+        // out of the signed macOS application process.
+        initializer.set_option("load-auto-profiles", "no")?;
+        initializer.set_option("load-console", false)?;
+        initializer.set_option("load-context-menu", false)?;
+        initializer.set_option("load-select", false)?;
+        initializer.set_option("load-stats-overlay", false)?;
+        initializer.set_option("ytdl", false)?;
         initializer.set_option("terminal", false)?;
         initializer.set_option(
             "vo",

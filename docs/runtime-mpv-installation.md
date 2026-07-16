@@ -14,16 +14,13 @@ The main HeyaClient process must start, open settings, connect to Heya, and use
 browser playback on a machine with no MPV installation. Therefore the release
 binary must not have a load-time dependency on libmpv.
 
-The in-progress renderer may continue using the current `native-mpv` Cargo
-feature for development. Once its rendering and lifecycle behavior are proven,
-its direct libmpv calls move behind a runtime-loaded API table using
-`dlopen`/`LoadLibrary`, or into an optional native helper. The existing
-`PlaybackEngine` boundary remains authoritative; the remote Heya page never
-receives library paths, download URLs, raw MPV commands, or install controls.
-
-The current one-shot libmpv availability cache must also become refreshable.
-Installing MPV after an initial failed probe must immediately make a new probe
-possible without restarting HeyaClient.
+On macOS, the `native-mpv` release feature now links Heya's own shim rather
+than libmpv. The shim resolves an allowlisted API table from the user's library
+with `dlopen` when native playback is requested. It caches successful loads but
+retries failures, so installing MPV and pressing **Check again** works without
+restarting HeyaClient. The existing `PlaybackEngine` boundary remains
+authoritative; the remote Heya page never receives library paths, download
+URLs, raw MPV commands, or install controls.
 
 ## Provider manifest
 
@@ -55,10 +52,10 @@ installation, updates, removal, or arbitrary process execution.
 
 ## macOS milestone
 
-1. Look for Homebrew only at `/opt/homebrew/bin/brew` and
-   `/usr/local/bin/brew`.
-2. Ask Homebrew for the installed MPV prefix and validate libmpv plus its
-   version.
+1. Discover an installed libmpv through Homebrew's stable prefixes at
+   `/opt/homebrew` and `/usr/local`, with MacPorts and conventional local
+   library prefixes as fallbacks.
+2. Validate compatibility by creating and initializing a probe instance.
 3. If absent, show an explicit confirmation for `brew install mpv`.
 4. Run that exact command without a shell and stream sanitized progress to the
    local settings page.
@@ -89,7 +86,10 @@ the active receipt. Removal deletes only HeyaClient-managed Windows files.
 
 ## Plugins
 
-MPV starts with normal global configuration and script autoloading disabled.
+MPV starts with normal global configuration, script autoloading, and its
+built-in Lua console/stats/select/auto-profile tools disabled. Heya owns those
+controls and diagnostics, and avoiding the unused LuaJIT tools keeps executable
+JIT pages out of the hardened macOS process.
 HeyaClient loads only plugins explicitly enabled from its own native-plugin
 directory. A plugin is trusted native playback code: it can affect playback and
 may invoke powerful MPV facilities. The settings UI must show its origin and
@@ -98,21 +98,20 @@ install plugins.
 
 ## Implementation order
 
-1. Finish and test the renderer using the existing development-only direct
-   libmpv feature.
-2. Preserve the renderer behind `PlaybackEngine` while replacing direct linkage
-   with a refreshable runtime loader.
+1. Finish and test the renderer behind `PlaybackEngine`. **Done.**
+2. Replace macOS direct linkage with a refreshable runtime loader. **Done.**
 3. Add native runtime status commands restricted to the local settings window.
-4. Implement macOS discovery and the explicit Homebrew action.
-5. Add settings UI for status, installation, failure, retry, and browser
-   fallback.
+   **Done.**
+4. Add macOS discovery and Settings retry. **Done.**
+5. Implement the explicit Homebrew install action and progress UI.
 6. Implement the verified Windows archive installer and test clean-machine
    installation, update, rollback, and removal.
 7. Add plugin discovery and explicit enablement after playback itself is stable.
 8. Design Linux package-manager/Flatpak behavior separately.
 
-Every ordinary CI and release build must run
-`scripts/verify-no-bundled-libmpv.py` against the default application bundle.
+Every macOS CI release runs `scripts/verify-no-bundled-libmpv.py` against the
+native-capable application bundle to prove it contains no bundled or load-time
+MPV runtime.
 
 ## Windows hardware-test preview
 

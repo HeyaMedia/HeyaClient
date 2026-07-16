@@ -1,14 +1,12 @@
 {
   "name": "heya-client",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "license": "MIT",
   "private": true,
   "type": "module",
   "scripts": {
     "bootstrap:build": "bun build bootstrap/index.html --minify --outdir bootstrap/dist",
     "bootstrap:check": "tsc --noEmit",
-    "native:stage:macos": "python3 scripts/stage-macos-libmpv.py",
-    "native:verify:macos": "sh scripts/verify-macos-native-bundle.sh",
     "tauri": "tauri",
     "dev": "tauri dev",
     "dev:native": "tauri dev --features native-mpv",

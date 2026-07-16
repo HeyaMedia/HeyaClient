@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Heya",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "identifier": "media.heya.client",
   "build": {
     "beforeDevCommand": "bun run bootstrap:build",
@@ -39,7 +39,13 @@
       "icons/icon.ico"
     ],
     "macOS": {
-      "signingIdentity": "-"
+      "signingIdentity": "-",
+      "entitlements": "Entitlements.plist"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
     },
     "android": {
       "debugApplicationIdSuffix": ".debug"

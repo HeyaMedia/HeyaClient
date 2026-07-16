@@ -24,8 +24,10 @@ For development with the native MPV backend enabled:
 bun run dev:native
 ```
 
-MPV is optional. If it is unavailable, video falls back to Heya's browser
-player. The native Rust audio engine is part of the regular client build.
+MPV is optional. On macOS, install it with `brew install mpv`; Heya discovers
+the system library at runtime and never bundles it. If it is unavailable,
+video falls back to Heya's browser player. The native Rust audio engine is part
+of the regular client build.
 
 ## Releases
 

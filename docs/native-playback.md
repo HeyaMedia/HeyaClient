@@ -106,37 +106,18 @@ Use `bun run dev:native` for the Heya bridge plus MPV backend, or
 The first surface is a separate MPV-owned native window. Heya HTML controls are
 not layered over it.
 
-## Development-only libmpv spike
+## Runtime-loaded libmpv on macOS
 
-HeyaClient is MIT-licensed. The current `native-mpv` feature links the
-developer's local libmpv and is not a public distribution configuration. No
-release workflow bundles the development renderer or publishes its dependency
-graph.
+HeyaClient is MIT-licensed and does not bundle or load-time link libmpv. The
+`native-mpv` release feature compiles Heya's small loader shim, which resolves
+the allowlisted libmpv API from a user-installed Homebrew or MacPorts library
+only when native playback is requested. A missing library leaves the app and
+browser video fallback fully operational.
 
-The current macOS development staging helper wraps MPV's official
-`TOOLS/dylib_unhell.py`:
-
-```sh
-bun run native:stage:macos -- \
-  src-tauri/target/debug/bundle/macos/Heya.app \
-  --mpv-source /path/to/pinned/mpv \
-  --adhoc-sign
-
-bun run native:verify:macos -- \
-  src-tauri/target/debug/bundle/macos/Heya.app
-```
-
-The helper exists only to test native playback on development machines. Public
-MIT builds use the browser backend until the optional, user-initiated runtime
-installation described below is implemented; they must not carry the
-development libmpv graph.
-
-The approved optional runtime-install direction and renderer handoff are in
-[`runtime-mpv-installation.md`](runtime-mpv-installation.md).
-
-When a staged bundle contains MoltenVK, HeyaClient pins `VK_DRIVER_FILES` to
-the bundled manifest before Tauri starts so a developer's global Vulkan driver
-is not loaded alongside it.
+Failed discovery remains retryable from Settings. Once a compatible library
+has loaded it stays resident for the app process, matching the normal dynamic
+library lifecycle. The approved installation direction and platform handoff
+are in [`runtime-mpv-installation.md`](runtime-mpv-installation.md).
 
 ## Authentication and networking
 

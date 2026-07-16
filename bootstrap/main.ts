@@ -583,7 +583,7 @@ async function refreshNativePlaybackStatus(): Promise<void> {
     } else {
       nativePlaybackStatusTitle.textContent = "MPV was not found";
       nativePlaybackStatusDetail.textContent = playback.build_includes_native_mpv
-        ? "The MPV backend could not be initialized. Browser playback remains available."
+        ? "Install MPV with Homebrew, then check again. Browser playback remains available."
         : "This build uses browser playback. Optional MPV installation support comes next.";
     }
   } catch (error) {

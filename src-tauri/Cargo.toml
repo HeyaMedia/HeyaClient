@@ -1,6 +1,6 @@
 [package]
 name = "heya-client"
-version = "0.2.0"
+version = "0.2.1"
 description = "Cross-platform native client for Heya"
 authors = ["HeyaMedia"]
 license = "MIT"
@@ -24,6 +24,7 @@ native-mpv = [
 ]
 
 [build-dependencies]
+cc = "1.2"
 pkg-config = "0.3.32"
 tauri-build = { version = "2.6.3", features = [] }
 

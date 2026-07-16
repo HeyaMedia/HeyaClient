@@ -1,17 +1,27 @@
 fn main() {
     if std::env::var_os("CARGO_FEATURE_NATIVE_MPV").is_some() {
-        if let Some(lib_dir) = std::env::var_os("HEYA_LIBMPV_DIR") {
-            println!(
-                "cargo:rustc-link-search=native={}",
-                lib_dir.to_string_lossy()
-            );
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+            println!("cargo:rerun-if-changed=native/mpv_runtime_shim.c");
+            cc::Build::new()
+                .file("native/mpv_runtime_shim.c")
+                .flag_if_supported("-std=c11")
+                .warnings(true)
+                .compile("mpv");
+            println!("cargo:rustc-link-lib=dylib=dl");
         } else {
-            pkg_config::Config::new()
-                .cargo_metadata(true)
-                .probe("mpv")
-                .expect(
-                    "native-mpv needs a staged libmpv; set HEYA_LIBMPV_DIR or provide mpv.pc on the development build host",
+            if let Some(lib_dir) = std::env::var_os("HEYA_LIBMPV_DIR") {
+                println!(
+                    "cargo:rustc-link-search=native={}",
+                    lib_dir.to_string_lossy()
                 );
+            } else {
+                pkg_config::Config::new()
+                    .cargo_metadata(true)
+                    .probe("mpv")
+                    .expect(
+                        "native-mpv needs a staged libmpv; set HEYA_LIBMPV_DIR or provide mpv.pc on the development build host",
+                    );
+            }
         }
     }
 
