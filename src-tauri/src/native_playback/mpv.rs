@@ -27,12 +27,19 @@ const SYNTHETIC_VIDEO_SOURCE: &str = "av://lavfi:testsrc2=duration=30:size=1280x
 const PLAYBACK_GRANT_HEADER_NAME: &str = "X-Heya-Playback-Grant";
 
 pub struct MpvEngineFactory {
+    #[cfg(target_os = "macos")]
     app: AppHandle,
 }
 
 impl MpvEngineFactory {
     pub fn new(app: AppHandle) -> Self {
-        Self { app }
+        #[cfg(not(target_os = "macos"))]
+        let _ = app;
+
+        Self {
+            #[cfg(target_os = "macos")]
+            app,
+        }
     }
 }
 
