@@ -22,7 +22,29 @@ interface NativePlaybackStatus {
   build_includes_native_mpv: boolean;
   video_surface: "native-window" | "native-surface";
   unavailable_reason: string | null;
+  installation: {
+    supported: boolean;
+    provider: string | null;
+    release: string | null;
+    downloadBytes: number | null;
+  };
 }
+
+type MpvInstallProgress =
+  | {
+      event: "started";
+      provider: string;
+      release: string;
+      total_bytes: number;
+    }
+  | {
+      event: "downloading";
+      downloaded_bytes: number;
+      total_bytes: number;
+    }
+  | { event: "verifying" }
+  | { event: "extracting" }
+  | { event: "installed"; provider: string; release: string };
 
 interface NativeAudioStatus {
   backend: "heya-rust-audio";
@@ -86,6 +108,15 @@ const nativePlaybackStatusDetail = requiredElement<HTMLElement>(
 );
 const refreshNativePlaybackButton = requiredElement<HTMLButtonElement>(
   "refresh-native-playback-button",
+);
+const nativePlaybackInstallActions = requiredElement<HTMLDivElement>(
+  "native-playback-install-actions",
+);
+const installNativePlaybackButton = requiredElement<HTMLButtonElement>(
+  "install-native-playback-button",
+);
+const nativePlaybackInstallDetail = requiredElement<HTMLElement>(
+  "native-playback-install-detail",
 );
 const nativeAudioStatus = requiredElement<HTMLDivElement>("native-audio-status");
 const nativeAudioStatusTitle = requiredElement<HTMLElement>(
@@ -184,6 +215,10 @@ bitPerfectAudioEnabled.addEventListener("change", () => {
 
 refreshNativePlaybackButton.addEventListener("click", () => {
   void refreshNativePlaybackStatus();
+});
+
+installNativePlaybackButton.addEventListener("click", () => {
+  void installNativePlaybackRuntime();
 });
 
 refreshNativeAudioButton.addEventListener("click", () => {
@@ -568,6 +603,7 @@ async function refreshNativePlaybackStatus(): Promise<void> {
   nativePlaybackStatusTitle.textContent = "Checking for MPV…";
   nativePlaybackStatusDetail.textContent = "Testing the native playback backend.";
   refreshNativePlaybackButton.disabled = true;
+  nativePlaybackInstallActions.hidden = true;
 
   try {
     const playback = await invoke<NativePlaybackStatus>(
@@ -582,15 +618,66 @@ async function refreshNativePlaybackStatus(): Promise<void> {
           : "Native video can render in an MPV window.";
     } else {
       nativePlaybackStatusTitle.textContent = "MPV was not found";
-      nativePlaybackStatusDetail.textContent = playback.build_includes_native_mpv
-        ? "Install MPV with Homebrew, then check again. Browser playback remains available."
-        : "This build uses browser playback. Optional MPV installation support comes next.";
+      if (playback.installation.supported) {
+        nativePlaybackStatusDetail.textContent =
+          "Install the verified MPV runtime for native playback, or continue using browser video.";
+        nativePlaybackInstallActions.hidden = false;
+        nativePlaybackInstallDetail.textContent = `${playback.installation.provider ?? "MPV"} · ${formatBytes(playback.installation.downloadBytes ?? 0)}`;
+      } else {
+        nativePlaybackStatusDetail.textContent = playback.build_includes_native_mpv
+          ? "Install MPV with Homebrew, then check again. Browser playback remains available."
+          : "This build uses browser playback. Optional MPV installation support comes next.";
+      }
     }
   } catch (error) {
     nativePlaybackStatus.dataset.available = "false";
     nativePlaybackStatusTitle.textContent = "Couldn’t check MPV";
     nativePlaybackStatusDetail.textContent = errorMessage(error);
   } finally {
+    refreshNativePlaybackButton.disabled = busy;
+  }
+}
+
+async function installNativePlaybackRuntime(): Promise<void> {
+  if (busy) return;
+  const confirmed = window.confirm(
+    "Download and install the verified MPV runtime for native video playback? It will be stored only in HeyaClient’s local app data.",
+  );
+  if (!confirmed) return;
+
+  installNativePlaybackButton.disabled = true;
+  refreshNativePlaybackButton.disabled = true;
+  nativePlaybackInstallDetail.textContent = "Preparing MPV installation…";
+  const progress = new Channel<MpvInstallProgress>();
+  progress.onmessage = (event) => {
+    if (event.event === "started") {
+      nativePlaybackInstallDetail.textContent = `Downloading ${event.provider}…`;
+    } else if (event.event === "downloading") {
+      const percent = event.total_bytes > 0
+        ? Math.min(100, Math.round((event.downloaded_bytes / event.total_bytes) * 100))
+        : 0;
+      nativePlaybackInstallDetail.textContent = `${percent}% downloaded`;
+    } else if (event.event === "verifying") {
+      nativePlaybackInstallDetail.textContent = "Verifying download…";
+    } else if (event.event === "extracting") {
+      nativePlaybackInstallDetail.textContent = "Installing MPV…";
+    } else {
+      nativePlaybackInstallDetail.textContent = "MPV installed.";
+    }
+  };
+
+  try {
+    await invoke<NativePlaybackStatus>("install_native_playback_runtime", {
+      onEvent: progress,
+    });
+    await refreshNativePlaybackStatus();
+  } catch (error) {
+    nativePlaybackStatus.dataset.available = "false";
+    nativePlaybackStatusTitle.textContent = "Couldn’t install MPV";
+    nativePlaybackStatusDetail.textContent = errorMessage(error);
+    nativePlaybackInstallActions.hidden = false;
+  } finally {
+    installNativePlaybackButton.disabled = busy;
     refreshNativePlaybackButton.disabled = busy;
   }
 }

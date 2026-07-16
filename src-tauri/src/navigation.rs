@@ -260,6 +260,16 @@ pub fn is_bootstrap_window(window: &WebviewWindow) -> bool {
     })
 }
 
+pub fn ensure_local_settings_window(window: &WebviewWindow, operation: &str) -> Result<(), String> {
+    if window.label() == SETTINGS_WINDOW_LABEL && is_bootstrap_window(window) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{operation} is available only from local HeyaClient settings"
+        ))
+    }
+}
+
 fn bootstrap_url(dev_url: Option<&Url>, query: &str) -> Url {
     let mut url = dev_url.cloned().unwrap_or_else(|| {
         if cfg!(any(target_os = "windows", target_os = "android")) {

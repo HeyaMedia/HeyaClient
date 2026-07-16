@@ -14,6 +14,7 @@ mod manager;
 ))]
 mod mpv;
 mod protocol;
+mod runtime_install;
 #[cfg(all(feature = "native-mpv", target_os = "macos"))]
 mod surface_macos;
 #[allow(dead_code)]
@@ -23,6 +24,7 @@ pub use bridge::*;
 pub use engine::*;
 pub use manager::*;
 pub use protocol::*;
+pub use runtime_install::*;
 pub(crate) use validation::validate_load;
 pub use validation::{PlaybackValidationError, ValidatedPlaybackLoad};
 

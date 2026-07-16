@@ -79,7 +79,7 @@ jobs:
           retention-days: 14
 
   windows-x64:
-    name: Windows x64 audio and MPV preview
+    name: Windows x64 app (Rust audio, installable MPV)
     runs-on: windows-2025
     timeout-minutes: 60
 
@@ -119,24 +119,14 @@ jobs:
       - name: Lint default Windows build
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
 
-      - name: Build normal Windows installer
-        run: bun tauri build --bundles nsis
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
-
-      - name: Verify normal build has no MPV dependency
-        run: python scripts/verify-no-bundled-libmpv.py src-tauri/target/release/heya-client.exe
-
-      - name: Prepare pinned Windows MPV development runtime
+      - name: Prepare pinned Windows MPV test runtime
         shell: pwsh
         run: |
           $runtime = & ./scripts/prepare-windows-libmpv.ps1 `
             -Architecture x86_64 `
             -OutputDirectory "$env:RUNNER_TEMP/heya-libmpv"
-          "HEYA_LIBMPV_DIR=$runtime" >> $env:GITHUB_ENV
-          "HEYA_MPV_RUNTIME_DIR=$runtime" >> $env:GITHUB_ENV
-          $runtime >> $env:GITHUB_PATH
+          "HEYA_LIBMPV_PATH=$runtime/libmpv-2.dll" >> $env:GITHUB_ENV
+          "HEYA_MPV_PROVIDER_ARCHIVE=$env:RUNNER_TEMP/heya-libmpv/provider.7z" >> $env:GITHUB_ENV
 
       - name: Test native MPV Windows build
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked --all-targets --features native-mpv
@@ -144,27 +134,14 @@ jobs:
       - name: Lint native MPV Windows build
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets --features native-mpv -- -D warnings
 
-      - name: Build native MPV Windows preview
-        run: cargo build --manifest-path src-tauri/Cargo.toml --locked --release --features native-mpv --bin heya-client
+      - name: Build Windows release and signed updater artifact
+        run: bun tauri build --features native-mpv --bundles nsis
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
 
-      - name: Stage native MPV preview
-        shell: pwsh
-        run: |
-          $preview = "$env:RUNNER_TEMP/heya-windows-x64-native-mpv-preview"
-          New-Item -ItemType Directory -Force $preview | Out-Null
-          Copy-Item src-tauri/target/release/heya-client.exe "$preview/Heya.exe"
-          Copy-Item "$env:HEYA_MPV_RUNTIME_DIR/libmpv-2.dll" $preview
-          Copy-Item "$env:HEYA_MPV_RUNTIME_DIR/provider-receipt.json" $preview
-          Copy-Item docs/windows-testing.md "$preview/TESTING.md"
-          @"
-          This private development preview uses the pinned libmpv provider described at:
-          https://github.com/shinchiro/mpv-winbuild-cmake/releases/tag/20260610
-
-          mpv revision: 304426c390901436fb1d4a63efbd582ae80c88f4
-          archive SHA-256: 8cbb25ea784f01afbb3f904217cab1317430a8bcfd5680fd827a866367f71cc9
-
-          It is not a production HeyaClient release. See TESTING.md.
-          "@ | Set-Content -Encoding UTF8 "$preview/MPV-PROVIDER.txt"
+      - name: Verify MPV is loaded only from Heya app data
+        run: python scripts/verify-no-bundled-libmpv.py src-tauri/target/release/heya-client.exe
 
       - name: Upload normal Windows installer
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
@@ -176,13 +153,6 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload native MPV Windows preview
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
-        with:
-          name: heya-windows-x64-native-mpv-preview
-          path: ${{ runner.temp }}/heya-windows-x64-native-mpv-preview
-          if-no-files-found: error
-          retention-days: 7
 
   publish-release:
     name: Publish GitHub Release

@@ -106,13 +106,20 @@ Use `bun run dev:native` for the Heya bridge plus MPV backend, or
 The first surface is a separate MPV-owned native window. Heya HTML controls are
 not layered over it.
 
-## Runtime-loaded libmpv on macOS
+## Runtime-loaded libmpv
 
 HeyaClient is MIT-licensed and does not bundle or load-time link libmpv. The
 `native-mpv` release feature compiles Heya's small loader shim, which resolves
 the allowlisted libmpv API from a user-installed Homebrew or MacPorts library
 only when native playback is requested. A missing library leaves the app and
 browser video fallback fully operational.
+
+Windows uses the same shim boundary with `LoadLibraryExW`. It accepts only the
+absolute Heya app-data runtime path (or an explicit developer override) and
+restricts dependency lookup to that DLL directory plus `System32`. The local
+settings window can install one architecture-matched, pinned provider archive
+after explicit approval; it verifies SHA-256 before extracting the single DLL.
+The remote Heya origin cannot trigger or configure installation.
 
 Failed discovery remains retryable from Settings. Once a compatible library
 has loaded it stays resident for the app process, matching the normal dynamic

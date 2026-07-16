@@ -473,6 +473,12 @@ button:disabled {
   gap: 8px;
 }
 
+.settings-actions small {
+  align-self: center;
+  color: var(--fg-2);
+  font-size: 10px;
+}
+
 .split-actions {
   justify-content: space-between;
 }

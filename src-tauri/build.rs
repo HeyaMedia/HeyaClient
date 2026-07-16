@@ -1,13 +1,15 @@
 fn main() {
     if std::env::var_os("CARGO_FEATURE_NATIVE_MPV").is_some() {
-        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let target_os = std::env::var("CARGO_CFG_TARGET_OS");
+        if matches!(target_os.as_deref(), Ok("macos" | "windows")) {
             println!("cargo:rerun-if-changed=native/mpv_runtime_shim.c");
-            cc::Build::new()
-                .file("native/mpv_runtime_shim.c")
-                .flag_if_supported("-std=c11")
-                .warnings(true)
-                .compile("mpv");
-            println!("cargo:rustc-link-lib=dylib=dl");
+            let mut shim = cc::Build::new();
+            shim.file("native/mpv_runtime_shim.c").warnings(true);
+            if target_os.as_deref() == Ok("macos") {
+                shim.flag_if_supported("-std=c11");
+                println!("cargo:rustc-link-lib=dylib=dl");
+            }
+            shim.compile("mpv");
         } else {
             if let Some(lib_dir) = std::env::var_os("HEYA_LIBMPV_DIR") {
                 println!(

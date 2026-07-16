@@ -62,60 +62,6 @@ if (-not (Test-Path $dll -PathType Leaf)) {
     throw "The verified provider archive did not contain libmpv-2.dll."
 }
 
-$programFilesX86 = [Environment]::GetFolderPath("ProgramFilesX86")
-$vswhere = Join-Path $programFilesX86 "Microsoft Visual Studio/Installer/vswhere.exe"
-if (-not (Test-Path $vswhere -PathType Leaf)) {
-    throw "Microsoft Visual Studio Build Tools could not be located."
-}
-$requiredToolComponent = if ($Architecture -eq "aarch64") {
-    "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
-} else {
-    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
-}
-$installationPath = & $vswhere -latest -products * `
-    -requires $requiredToolComponent `
-    -property installationPath
-if (-not $installationPath) {
-    throw "The Visual C++ tools for $Architecture are required for the Windows MPV preview."
-}
-$toolsRoot = Join-Path $installationPath "VC/Tools/MSVC"
-$toolsVersion = Get-ChildItem $toolsRoot -Directory |
-    Sort-Object { [Version]$_.Name } -Descending |
-    Select-Object -First 1
-if ($null -eq $toolsVersion) {
-    throw "The installed Visual C++ toolchain has no MSVC tools directory."
-}
-$targetDirectory = if ($Architecture -eq "aarch64") { "arm64" } else { "x64" }
-$machine = if ($Architecture -eq "aarch64") { "ARM64" } else { "X64" }
-$toolDirectory = Join-Path $toolsVersion.FullName "bin/Hostx64/$targetDirectory"
-$dumpbin = Join-Path $toolDirectory "dumpbin.exe"
-$libTool = Join-Path $toolDirectory "lib.exe"
-if (-not (Test-Path $dumpbin -PathType Leaf) -or -not (Test-Path $libTool -PathType Leaf)) {
-    throw "The required MSVC import-library tools could not be located."
-}
-
-$dump = & $dumpbin /nologo /exports $dll
-if ($LASTEXITCODE -ne 0) {
-    throw "dumpbin could not inspect libmpv-2.dll."
-}
-$exports = foreach ($line in $dump) {
-    if ($line -match '^\s+\d+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+([A-Za-z_][A-Za-z0-9_@?$]*)\s*$') {
-        $Matches[1]
-    }
-}
-$exports = @($exports | Sort-Object -Unique)
-if ($exports.Count -lt 20 -or -not ($exports -contains "mpv_create")) {
-    throw "The provider DLL did not expose the expected libmpv API."
-}
-
-$definition = Join-Path $extractDirectory "mpv.def"
-@('LIBRARY "libmpv-2.dll"', "EXPORTS") + $exports | Set-Content -Encoding Ascii $definition
-$importLibrary = Join-Path $extractDirectory "mpv.lib"
-& $libTool /nologo "/def:$definition" "/machine:$machine" "/out:$importLibrary" | Out-Null
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path $importLibrary -PathType Leaf)) {
-    throw "MSVC could not generate the libmpv import library."
-}
-
 $receipt = [ordered]@{
     schemaVersion = 1
     provider = [string]$manifest.windows.provider
@@ -125,9 +71,8 @@ $receipt = [ordered]@{
     architecture = $Architecture
     archiveSha256 = $actualHash
     library = "libmpv-2.dll"
-    developmentPreviewOnly = $true
+    ciTestRuntimeOnly = $true
 }
 $receipt | ConvertTo-Json | Set-Content -Encoding UTF8 (Join-Path $extractDirectory "provider-receipt.json")
-Remove-Item $archive -Force
 
 Write-Output $extractDirectory

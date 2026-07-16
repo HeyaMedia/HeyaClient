@@ -1,14 +1,11 @@
-# Windows preview testing
-
-The Windows CI job produces two separate artifacts so the stable application
-and the in-progress MPV adapter do not share a release boundary.
-
-## Normal installer
+# Windows testing
 
 `heya-windows-x64-installer` is the ordinary MIT build. It includes the Rust
 audio engine and uses CPAL's Windows WASAPI backend. It deliberately has no
 load-time MPV dependency, so it must launch on a clean Windows 10/11 machine
-and retain browser video playback when MPV is unavailable.
+and retain browser video playback when MPV is unavailable. Its local settings
+window can install the pinned MPV runtime into per-user app data after explicit
+approval; MPV is not bundled in the application or NSIS installer.
 
 Windows processed audio supports:
 
@@ -22,17 +19,6 @@ Bit-perfect playback is not advertised on Windows yet. CPAL's current WASAPI
 output is shared-mode and may invoke the Windows mixer/converter. A future
 WASAPI exclusive adapter must prove exact device format negotiation before the
 setting is enabled.
-
-## Native MPV preview
-
-`heya-windows-x64-native-mpv-preview` is a private development artifact, not a
-production installer. Extract the entire directory and run `Heya.exe` without
-moving the DLL away from it. The directory contains the pinned development
-`libmpv-2.dll`, its provider receipt, and source/provider reference.
-
-The preview exists only to validate the current directly linked MPV adapter on
-real Windows hardware before the user-initiated runtime loader/installer is
-implemented. Do not publish it as a normal HeyaClient release.
 
 ## Tester checklist
 
@@ -53,10 +39,11 @@ devices used. Then verify:
 8. Changing or disconnecting the active Windows output produces a visible
    playback error instead of silent, apparently-playing audio. Starting again
    after selecting a valid device recovers.
-9. The normal installer uses browser video and launches with no MPV files
-   installed.
-10. The native preview reports MPV available and opens video in a separate
-    native window.
+9. A clean install reports MPV unavailable, uses browser video, and offers the
+   verified MPV installation action only in local settings.
+10. Approving installation downloads, verifies, and activates MPV without
+    restarting HeyaClient. Reopening settings reports MPV available and native
+    video opens in a separate player window.
 11. MPV play/pause, seek, volume, mute, audio tracks, subtitles, fullscreen,
     resizing, window close, and replay all work.
 12. The information panel identifies MPV and reports the actual hardware
@@ -64,6 +51,6 @@ devices used. Then verify:
 13. Closing MPV does not mark unfinished media complete. Closing Heya,
     switching servers, logging out, and reloading dispose playback cleanly.
 
-Debug preview logs should be included with any failure report, but playback
+Debug logs should be included with any failure report, but playback
 grants, media URLs, cookies, and account credentials must be removed before
 sharing them.

@@ -63,3 +63,6 @@ jobs:
 
       - name: Lint Rust build
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets -- -D warnings
+
+      - name: Lint native MPV build
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --locked --all-targets --features native-mpv -- -D warnings

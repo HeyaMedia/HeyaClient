@@ -14,13 +14,13 @@ The main HeyaClient process must start, open settings, connect to Heya, and use
 browser playback on a machine with no MPV installation. Therefore the release
 binary must not have a load-time dependency on libmpv.
 
-On macOS, the `native-mpv` release feature now links Heya's own shim rather
-than libmpv. The shim resolves an allowlisted API table from the user's library
-with `dlopen` when native playback is requested. It caches successful loads but
-retries failures, so installing MPV and pressing **Check again** works without
-restarting HeyaClient. The existing `PlaybackEngine` boundary remains
-authoritative; the remote Heya page never receives library paths, download
-URLs, raw MPV commands, or install controls.
+The `native-mpv` release feature links Heya's own shim rather than libmpv. On
+macOS it resolves an allowlisted API table with `dlopen`; on Windows it uses
+`LoadLibraryExW` with a narrowly scoped dependency search. It caches successful
+loads but retries failures, so installing MPV and pressing **Check again**
+works without restarting HeyaClient. The existing `PlaybackEngine` boundary
+remains authoritative; the remote Heya page never receives library paths,
+download URLs, raw MPV commands, or install controls.
 
 ## Provider manifest
 
@@ -80,6 +80,12 @@ page and browser playback remains selected.
    the directory into place.
 7. Load the DLL through the runtime API and re-probe capabilities.
 
+This milestone is implemented. The runtime lives below HeyaClient's per-user
+local app-data directory and is never copied into the application installation
+directory or release artifact. `LoadLibraryExW` searches only the verified DLL
+directory and `System32` for dependencies; it does not search the current
+directory, `PATH`, or arbitrary package-manager locations.
+
 Failed or cancelled installations remove the temporary directory. Updates are
 explicit user actions and install beside the previous version before switching
 the active receipt. Removal deletes only HeyaClient-managed Windows files.
@@ -104,24 +110,19 @@ install plugins.
    **Done.**
 4. Add macOS discovery and Settings retry. **Done.**
 5. Implement the explicit Homebrew install action and progress UI.
-6. Implement the verified Windows archive installer and test clean-machine
-   installation, update, rollback, and removal.
+6. Implement the verified Windows archive installer. **Done.** Clean-machine
+   hardware validation remains required.
 7. Add plugin discovery and explicit enablement after playback itself is stable.
 8. Design Linux package-manager/Flatpak behavior separately.
 
-Every macOS CI release runs `scripts/verify-no-bundled-libmpv.py` against the
-native-capable application bundle to prove it contains no bundled or load-time
-MPV runtime.
+Every macOS and Windows CI release runs `scripts/verify-no-bundled-libmpv.py`
+against the native-capable application binary to prove it contains no bundled
+or load-time MPV runtime.
 
-## Windows hardware-test preview
+## Windows hardware validation
 
-Until the runtime loader and user-initiated installer exist, CI may produce a
-private, explicitly named Windows development preview containing the pinned
-provider DLL beside a debug Heya executable. This is not a normal release or
-installer. Its only purpose is real-hardware validation of the directly linked
-adapter, and it must include the provider receipt/source reference plus the
-tester boundary in `docs/windows-testing.md`.
-
-The ordinary Windows installer is built and verified separately and must still
-launch without MPV. Passing the preview tests does not satisfy the production
-runtime-install milestone.
+The normal release is the test artifact. It must launch without MPV, offer the
+local verified install action, activate native playback without an application
+restart, and continue to fall back to browser playback when installation is
+declined or fails. The real-hardware checklist lives in
+[`windows-testing.md`](windows-testing.md).

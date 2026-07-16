@@ -20,6 +20,7 @@ struct NativePlaybackStatus {
     build_includes_native_mpv: bool,
     video_surface: native_playback::NativeVideoSurface,
     unavailable_reason: Option<native_playback::BridgeErrorCode>,
+    installation: native_playback::MpvInstallationOffer,
 }
 
 #[derive(Serialize)]
@@ -46,6 +47,12 @@ fn get_app_settings(state: State<'_, AppState>) -> AppSettings {
 fn get_native_playback_status(
     playback: State<'_, native_playback::NativePlaybackManager>,
 ) -> NativePlaybackStatus {
+    native_playback_status(&playback)
+}
+
+fn native_playback_status(
+    playback: &native_playback::NativePlaybackManager,
+) -> NativePlaybackStatus {
     let capabilities = playback.capabilities();
     NativePlaybackStatus {
         backend: capabilities.backend,
@@ -60,7 +67,24 @@ fn get_native_playback_status(
         )),
         video_surface: capabilities.video_surface,
         unavailable_reason: capabilities.unavailable_reason,
+        installation: native_playback::mpv_installation_offer(),
     }
+}
+
+#[tauri::command]
+async fn install_native_playback_runtime(
+    app: AppHandle,
+    invoking_window: WebviewWindow,
+    playback: State<'_, native_playback::NativePlaybackManager>,
+    on_event: tauri::ipc::Channel<native_playback::MpvInstallProgress>,
+) -> Result<NativePlaybackStatus, String> {
+    navigation::ensure_local_settings_window(&invoking_window, "MPV installation")?;
+    native_playback::install_mpv_runtime(app, on_event).await?;
+    let status = native_playback_status(&playback);
+    if !status.available {
+        return Err("MPV was installed but its native backend could not initialize".into());
+    }
+    Ok(status)
 }
 
 #[tauri::command]
@@ -187,6 +211,7 @@ pub fn run() {
             get_server_profile,
             get_app_settings,
             get_native_playback_status,
+            install_native_playback_runtime,
             get_native_audio_status,
             save_app_settings,
             connect_to_server,
@@ -257,6 +282,12 @@ pub fn run() {
                     .map_err(std::io::Error::other)?;
             }
 
+            #[cfg(all(
+                feature = "native-mpv",
+                any(target_os = "macos", target_os = "windows", target_os = "linux")
+            ))]
+            native_playback::configure_runtime_loader(app.handle())
+                .map_err(std::io::Error::other)?;
             #[cfg(all(
                 feature = "native-mpv",
                 any(target_os = "macos", target_os = "windows", target_os = "linux")

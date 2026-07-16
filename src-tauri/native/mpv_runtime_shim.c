@@ -1,5 +1,5 @@
 /*
- * Heya's macOS runtime libmpv loader.
+ * Heya's macOS and Windows runtime libmpv loader.
  *
  * This MIT-licensed shim deliberately contains no MPV code and links no MPV
  * library into Heya. It exports the small libmpv surface used by our Rust
@@ -8,12 +8,19 @@
  * discover an installation made while Heya is running.
  */
 
-#include <dlfcn.h>
-#include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <wchar.h>
+#else
+#include <dlfcn.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#endif
 
 #define MPV_ERROR_UNINITIALIZED (-3)
 
@@ -62,22 +69,50 @@ typedef struct heya_mpv_api {
 } heya_mpv_api;
 
 static heya_mpv_api API;
+#ifdef _WIN32
+static HMODULE LIBRARY_HANDLE;
+static SRWLOCK LOAD_MUTEX = SRWLOCK_INIT;
+static volatile LONG LOADED = 0;
+static wchar_t RUNTIME_PATH[32768];
+#else
 static void *LIBRARY_HANDLE;
 static pthread_mutex_t LOAD_MUTEX = PTHREAD_MUTEX_INITIALIZER;
 static atomic_bool LOADED = false;
+#endif
 
 static int runtime_disabled(void) {
+#ifdef _WIN32
+  wchar_t value[8] = {0};
+  DWORD length = GetEnvironmentVariableW(L"HEYA_LIBMPV_DISABLE", value, 8);
+  return length == 1 && value[0] == L'1';
+#else
   const char *value = getenv("HEYA_LIBMPV_DISABLE");
   return value && strcmp(value, "1") == 0;
+#endif
 }
 
-static int resolve_api(void *handle, heya_mpv_api *api) {
+static int resolve_api(
+#ifdef _WIN32
+    HMODULE handle,
+#else
+    void *handle,
+#endif
+    heya_mpv_api *api) {
+#ifdef _WIN32
+#define RESOLVE(field, symbol)                                                   \
+  do {                                                                           \
+    *(FARPROC *)(&api->field) = GetProcAddress(handle, symbol);                  \
+    if (!api->field)                                                              \
+      return 0;                                                                   \
+  } while (0)
+#else
 #define RESOLVE(field, symbol)                                                   \
   do {                                                                           \
     *(void **)(&api->field) = dlsym(handle, symbol);                             \
     if (!api->field)                                                              \
       return 0;                                                                   \
   } while (0)
+#endif
 
   RESOLVE(client_api_version, "mpv_client_api_version");
   RESOLVE(create, "mpv_create");
@@ -104,6 +139,79 @@ static int resolve_api(void *handle, heya_mpv_api *api) {
   return 1;
 }
 
+#ifdef _WIN32
+static int absolute_windows_path(const wchar_t *path) {
+  if (!path || !path[0])
+    return 0;
+  if (path[0] == L'\\' && path[1] == L'\\')
+    return 1;
+  return ((path[0] >= L'A' && path[0] <= L'Z') ||
+          (path[0] >= L'a' && path[0] <= L'z')) &&
+         path[1] == L':' && (path[2] == L'\\' || path[2] == L'/');
+}
+
+static int try_path(const wchar_t *path) {
+  if (!absolute_windows_path(path))
+    return 0;
+
+  /* Search the verified runtime directory and System32 only. */
+  HMODULE handle = LoadLibraryExW(path, NULL, 0x00000100 | 0x00000800);
+  if (!handle)
+    return 0;
+
+  heya_mpv_api candidate = {0};
+  if (!resolve_api(handle, &candidate)) {
+    FreeLibrary(handle);
+    return 0;
+  }
+
+  API = candidate;
+  LIBRARY_HANDLE = handle;
+  InterlockedExchange(&LOADED, 1);
+  return 1;
+}
+
+/* Called by Rust with Heya's app-data runtime before the first probe. */
+int heya_mpv_set_runtime_path(const wchar_t *path) {
+  if (!absolute_windows_path(path))
+    return 0;
+
+  AcquireSRWLockExclusive(&LOAD_MUTEX);
+  if (InterlockedCompareExchange(&LOADED, 0, 0) == 0) {
+    size_t length = wcslen(path);
+    if (length >= (sizeof(RUNTIME_PATH) / sizeof(RUNTIME_PATH[0]))) {
+      ReleaseSRWLockExclusive(&LOAD_MUTEX);
+      return 0;
+    }
+    memcpy(RUNTIME_PATH, path, (length + 1) * sizeof(wchar_t));
+  }
+  ReleaseSRWLockExclusive(&LOAD_MUTEX);
+  return 1;
+}
+
+static int ensure_loaded(void) {
+  if (InterlockedCompareExchange(&LOADED, 0, 0) != 0)
+    return 1;
+  if (runtime_disabled())
+    return 0;
+
+  AcquireSRWLockExclusive(&LOAD_MUTEX);
+  if (InterlockedCompareExchange(&LOADED, 0, 0) == 0) {
+    wchar_t override_path[32768] = {0};
+    DWORD override_length = GetEnvironmentVariableW(
+        L"HEYA_LIBMPV_PATH", override_path,
+        (DWORD)(sizeof(override_path) / sizeof(override_path[0])));
+    if (override_length > 0 &&
+        override_length < (sizeof(override_path) / sizeof(override_path[0])))
+      try_path(override_path);
+    if (InterlockedCompareExchange(&LOADED, 0, 0) == 0 && RUNTIME_PATH[0])
+      try_path(RUNTIME_PATH);
+  }
+  int loaded = InterlockedCompareExchange(&LOADED, 0, 0) != 0;
+  ReleaseSRWLockExclusive(&LOAD_MUTEX);
+  return loaded;
+}
+#else
 static int try_path(const char *path) {
   if (!path || path[0] != '/')
     return 0;
@@ -153,6 +261,7 @@ static int ensure_loaded(void) {
   pthread_mutex_unlock(&LOAD_MUTEX);
   return loaded;
 }
+#endif
 
 unsigned long mpv_client_api_version(void) {
   return ensure_loaded() ? API.client_api_version() : 0;

@@ -4,7 +4,7 @@
   "automaticInstall": false,
   "automaticUpdate": false,
   "macos": {
-    "status": "planned",
+    "status": "discoveryImplemented",
     "installKind": "homebrew",
     "formula": "mpv",
     "minimumVersion": "0.41.0",
@@ -16,7 +16,7 @@
     "notes": "Use an existing Homebrew installation. Never install or remove Homebrew itself, and never uninstall a user-owned MPV installation."
   },
   "windows": {
-    "status": "planned",
+    "status": "implemented",
     "installKind": "verifiedArchive",
     "provider": "shinchiro/mpv-winbuild-cmake",
     "providerPage": "https://github.com/shinchiro/mpv-winbuild-cmake/releases/tag/20260610",
@@ -28,11 +28,13 @@
       "x86_64": {
         "url": "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260610/mpv-dev-x86_64-20260610-git-304426c.7z",
         "sha256": "8cbb25ea784f01afbb3f904217cab1317430a8bcfd5680fd827a866367f71cc9",
+        "downloadBytes": 30294671,
         "library": "libmpv-2.dll"
       },
       "aarch64": {
         "url": "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/20260610/mpv-dev-aarch64-20260610-git-304426c.7z",
         "sha256": "d9dd60db1c7b24db2e19d041f70abf0a4995f3e9eadf80a34e54f72300df6ed4",
+        "downloadBytes": 24840618,
         "library": "libmpv-2.dll"
       }
     },

@@ -1,6 +1,6 @@
 [package]
 name = "heya-client"
-version = "0.2.1"
+version = "0.2.2"
 description = "Cross-platform native client for Heya"
 authors = ["HeyaMedia"]
 license = "MIT"
@@ -59,9 +59,15 @@ cpal = { version = "0.18.1", features = ["realtime"] }
 # windows crate. Pin the matching generation until CPAL narrows that range;
 # mixing the two makes its COM implementations fail to compile on Windows.
 windows-core = "=0.61.2"
+sevenz-rust2 = { version = "0.20.2", default-features = false }
+sha2 = "0.10.9"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 cpal = "0.18.1"
+
+[dev-dependencies]
+sevenz-rust2 = { version = "0.20.2", default-features = false }
+sha2 = "0.10.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 coreaudio-rs = "0.14.2"

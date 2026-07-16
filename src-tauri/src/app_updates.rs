@@ -177,13 +177,7 @@ pub async fn install_update(
 }
 
 fn ensure_settings_caller(window: &WebviewWindow) -> Result<(), String> {
-    if window.label() == crate::navigation::SETTINGS_WINDOW_LABEL
-        && crate::navigation::is_bootstrap_window(window)
-    {
-        Ok(())
-    } else {
-        Err("the updater is available only from local HeyaClient settings".to_string())
-    }
+    crate::navigation::ensure_local_settings_window(window, "the updater")
 }
 
 pub fn check_on_startup(app: AppHandle) {
