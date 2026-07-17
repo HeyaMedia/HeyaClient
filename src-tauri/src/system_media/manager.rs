@@ -436,7 +436,7 @@ fn cache_artwork(
 fn artwork_file_url(path: &Path) -> Result<String, BridgeError> {
     #[cfg(target_os = "windows")]
     {
-        return Ok(format!("file://{}", path.to_string_lossy()));
+        Ok(format!("file://{}", path.to_string_lossy()))
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -680,10 +680,7 @@ fn current_platform() -> SystemMediaPlatform {
 
 fn platform_config(window: &WebviewWindow) -> PlatformConfig<'static> {
     #[cfg(target_os = "windows")]
-    let hwnd = window
-        .hwnd()
-        .ok()
-        .map(|handle| handle.0 as *mut std::ffi::c_void);
+    let hwnd = window.hwnd().ok().map(|handle| handle.0);
     #[cfg(not(target_os = "windows"))]
     let hwnd = {
         let _ = window;
