@@ -39,8 +39,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository", required=True)
     parser.add_argument("--tag", required=True)
-    parser.add_argument("--macos", required=True, type=pathlib.Path)
-    parser.add_argument("--windows", required=True, type=pathlib.Path)
+    parser.add_argument("--macos", type=pathlib.Path)
+    parser.add_argument("--windows", type=pathlib.Path)
     parser.add_argument("--output", required=True, type=pathlib.Path)
     args = parser.parse_args()
 
@@ -48,16 +48,21 @@ def main() -> int:
         parser.error(f"release tag {args.tag!r} is not a supported semantic version tag")
 
     try:
-        macos_artifact = exactly_one(args.macos, "*.app.tar.gz")
-        windows_artifact = exactly_one(args.windows, "*.exe")
-        macos_release = {
-            "url": release_url(args.repository, args.tag, macos_artifact),
-            "signature": signature_for(macos_artifact),
-        }
-        windows_release = {
-            "url": release_url(args.repository, args.tag, windows_artifact),
-            "signature": signature_for(windows_artifact),
-        }
+        platforms = {}
+        if args.macos is not None and args.macos.is_dir():
+            macos_artifact = exactly_one(args.macos, "*.app.tar.gz")
+            platforms["darwin-aarch64"] = {
+                "url": release_url(args.repository, args.tag, macos_artifact),
+                "signature": signature_for(macos_artifact),
+            }
+        if args.windows is not None and args.windows.is_dir():
+            windows_artifact = exactly_one(args.windows, "*.exe")
+            platforms["windows-x86_64"] = {
+                "url": release_url(args.repository, args.tag, windows_artifact),
+                "signature": signature_for(windows_artifact),
+            }
+        if not platforms:
+            raise ValueError("no completed platform artifacts were provided")
     except ValueError as error:
         print(error, file=sys.stderr)
         return 1
@@ -69,10 +74,7 @@ def main() -> int:
         .replace(microsecond=0)
         .isoformat()
         .replace("+00:00", "Z"),
-        "platforms": {
-            "darwin-aarch64": macos_release,
-            "windows-x86_64": windows_release,
-        },
+        "platforms": platforms,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
