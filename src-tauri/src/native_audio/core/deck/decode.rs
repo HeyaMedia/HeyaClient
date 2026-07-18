@@ -6,8 +6,9 @@
 //!   that fills as HTTP chunks arrive. Playback starts after the first batch.
 
 use anyhow::{Context, Result};
+use std::sync::LazyLock;
 use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{self, DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::{self, CodecRegistry, DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
@@ -15,6 +16,16 @@ use symphonia::core::probe::Hint;
 use tracing::{debug, warn};
 
 use super::streaming::StreamingReader;
+
+/// Symphonia's enabled codecs with FDK-AAC registered in place of its native
+/// AAC decoder. The FDK adapter also covers HE-AAC files that the native
+/// decoder cannot handle.
+static CODEC_REGISTRY: LazyLock<CodecRegistry> = LazyLock::new(|| {
+    let mut registry = CodecRegistry::new();
+    symphonia::default::register_enabled_codecs(&mut registry);
+    registry.register_all::<symphonia_adapter_fdk_aac::AacDecoder>();
+    registry
+});
 
 /// Active decoder state — kept alive between batch decode calls.
 pub struct DecoderSetup {
@@ -84,7 +95,7 @@ pub fn probe_from_source(mss: MediaSourceStream, ext: Option<&str>) -> Result<De
     let duration_samples = track.codec_params.n_frames;
     let track_id = track.id;
 
-    let decoder = symphonia::default::get_codecs()
+    let decoder = CODEC_REGISTRY
         .make(&track.codec_params, &DecoderOptions::default())
         .context("failed to create decoder")?;
 
@@ -367,6 +378,24 @@ mod tests {
             "streaming: expected ~{} samples, got {}",
             expected,
             samples.len()
+        );
+    }
+
+    #[test]
+    fn custom_registry_uses_fdk_aac_and_keeps_alac() {
+        assert!(
+            symphonia::default::get_codecs()
+                .get_codec(codecs::CODEC_TYPE_AAC)
+                .is_none(),
+            "Symphonia's native AAC decoder must remain disabled"
+        );
+        assert!(
+            CODEC_REGISTRY.get_codec(codecs::CODEC_TYPE_AAC).is_some(),
+            "the FDK-AAC adapter must be registered"
+        );
+        assert!(
+            CODEC_REGISTRY.get_codec(codecs::CODEC_TYPE_ALAC).is_some(),
+            "ALAC support must remain registered"
         );
     }
 }
