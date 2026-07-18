@@ -1,6 +1,7 @@
 //! Crossfade — all transition strategies and scheduling.
 
 pub mod album_aware;
+pub mod boundary;
 pub mod curves;
 pub mod mixramp;
 pub mod scheduler;
@@ -8,6 +9,7 @@ pub mod time_based;
 pub mod types;
 
 use self::album_aware::should_suppress_crossfade;
+use self::boundary::compute_boundary_transition;
 use self::curves::{generate_fade_in, generate_fade_out, steps_for_duration};
 use self::mixramp::compute_mixramp_transition;
 use self::time_based::compute_timed_transition;
@@ -17,7 +19,8 @@ use self::types::{CrossfadeParams, TransitionPlan};
 ///
 /// Strategy selection:
 /// 1. If crossfade is suppressed (same album), returns `None`.
-/// 2. If smart crossfade is enabled, tries MixRamp first, falls back to timed.
+/// 2. If smart crossfade is enabled, prefer Heya's structural boundary analysis,
+///    then try MixRamp metadata, and finally fall back to a timed transition.
 /// 3. Otherwise, uses timed crossfade.
 pub fn compute_transition(params: &CrossfadeParams) -> Option<TransitionPlan> {
     if should_suppress_crossfade(
@@ -29,7 +32,7 @@ pub fn compute_transition(params: &CrossfadeParams) -> Option<TransitionPlan> {
     }
 
     if params.smart_crossfade_enabled {
-        compute_mixramp_transition(params)
+        compute_boundary_transition(params).or_else(|| compute_mixramp_transition(params))
     } else {
         compute_timed_transition(params)
     }

@@ -159,17 +159,17 @@ impl AudioEngine {
                     if atomics_for_position_thread.get_state() == EngineState::Stopped {
                         continue;
                     }
-                    let samples = atomics_for_position_thread
-                        .position_samples
+                    let frames = atomics_for_position_thread
+                        .position_frames
                         .load(Ordering::Relaxed);
                     let duration_ms = atomics_for_position_thread
                         .duration_ms
                         .load(Ordering::Relaxed);
-                    let divisor = u64::from(device_sample_rate) * u64::from(device_channels);
+                    let divisor = u64::from(device_sample_rate);
                     if divisor == 0 {
                         continue;
                     }
-                    let position_ms = ((samples as f64 / divisor as f64) * 1000.0) as u64;
+                    let position_ms = ((frames as f64 / divisor as f64) * 1000.0) as u64;
                     let _ = position_events.try_send(EngineEvent::Position {
                         position_ms: position_ms.min(duration_ms),
                         duration_ms,
@@ -408,6 +408,23 @@ fn control_thread_main(
                     normalization_enabled = enabled;
                     let _ = audio_cmd_tx.send(AudioCommand::SetNormalization(enabled));
                 }
+                Command::UpdateTrackAnalysis {
+                    rating_key,
+                    gain_db,
+                    intro_end_ms,
+                    outro_start_ms,
+                    fade_start_ms,
+                    silence_start_ms,
+                } => {
+                    let _ = audio_cmd_tx.send(AudioCommand::UpdateTrackAnalysis {
+                        rating_key,
+                        gain_db,
+                        intro_end_ms,
+                        outro_start_ms,
+                        fade_start_ms,
+                        silence_start_ms,
+                    });
+                }
                 Command::SetPreampGain { db } => {
                     let _ = audio_cmd_tx.send(AudioCommand::SetPreampGain(db));
                 }
@@ -542,7 +559,8 @@ fn handle_play(
                 output_channels: device_channels,
             });
 
-            // Resolve gain: Plex metadata → cached analysis → fresh EBU R128 analysis
+            // The client resolves track/album loudness policy and passes the
+            // resulting gain. The engine applies that scalar in the DSP chain.
             let gain_db = meta.gain_db;
             let norm_gain = if normalization_enabled {
                 gain_db.map_or(1.0, |db| 10.0_f32.powf(db / 20.0))
@@ -660,6 +678,14 @@ fn handle_preload(
             let source_channels = result.source_channels;
             let has_more = result.has_more;
 
+            let _ = event_tx.send(EngineEvent::Format {
+                rating_key: meta.rating_key,
+                source_sample_rate: source_rate,
+                source_channels,
+                output_sample_rate: device_rate,
+                output_channels: device_channels,
+            });
+
             let gain_db = meta.gain_db;
             let norm_gain = if normalization_enabled {
                 gain_db.map_or(1.0, |db| 10.0_f32.powf(db / 20.0))
@@ -684,7 +710,13 @@ fn handle_preload(
             ) {
                 Ok(buffer) => buffer,
                 Err(message) => {
-                    let _ = event_tx.send(EngineEvent::Error { message });
+                    atomics
+                        .preload_error_rk
+                        .store(meta.rating_key, Ordering::Relaxed);
+                    let _ = event_tx.send(EngineEvent::PreloadError {
+                        rating_key: meta.rating_key,
+                        message,
+                    });
                     return;
                 }
             };
@@ -734,7 +766,11 @@ fn handle_preload(
         }
         Err(e) => {
             warn!(rating_key = meta.rating_key, error = %e, "preload failed");
-            let _ = event_tx.send(EngineEvent::Error {
+            atomics
+                .preload_error_rk
+                .store(meta.rating_key, Ordering::Relaxed);
+            let _ = event_tx.send(EngineEvent::PreloadError {
+                rating_key: meta.rating_key,
                 message: format!("preload failed: {}", e),
             });
         }

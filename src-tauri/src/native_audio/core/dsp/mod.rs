@@ -50,15 +50,15 @@ impl DspChain {
     /// Process a buffer of interleaved f32 samples through the entire chain.
     pub fn process(&mut self, samples: &mut [f32], sample_rate: u32, channels: u16) {
         use traits::DspBlock;
+        self.preamp.process(samples, sample_rate, channels);
         if self.crossfeed_before_eq {
             self.crossfeed.process(samples, sample_rate, channels);
         }
-        self.preamp.process(samples, sample_rate, channels);
         self.equalizer.process(samples, sample_rate, channels);
-        self.postgain.process(samples, sample_rate, channels);
         if !self.crossfeed_before_eq {
             self.crossfeed.process(samples, sample_rate, channels);
         }
+        self.postgain.process(samples, sample_rate, channels);
         self.limiter.process(samples, sample_rate, channels);
         self.volume.process(samples, sample_rate, channels);
     }
@@ -74,6 +74,7 @@ impl DspChain {
     pub fn reset(&mut self) {
         self.equalizer.reset();
         self.crossfeed.reset();
+        self.limiter.reset();
     }
 
     // -- Convenience setters that match the JS engine API --

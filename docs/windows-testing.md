@@ -33,9 +33,11 @@ devices used. Then verify:
 4. Selecting an endpoint routes the next playback session to it and the choice
    survives reopening settings.
 5. Music starts, pauses, seeks, resumes after reload, advances, and stops.
-6. EQ, ReplayGain, crossfeed, limiter, gapless playback, and a timed crossfade
-   each work without stutter.
-7. Waveform and FFT visualizers continue updating under native playback.
+6. EQ, ReplayGain (including album mode), crossfeed, limiter, gapless playback,
+   timed crossfade, smart crossfade, and same-album suppression each work without
+   stutter.
+7. The waveform spans the complete track and its visible features stay aligned
+   with playback; FFT visualizers continue updating under native playback.
 8. Changing or disconnecting the active Windows output produces a visible
    playback error instead of silent, apparently-playing audio. Starting again
    after selecting a valid device recovers.

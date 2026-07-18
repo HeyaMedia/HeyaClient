@@ -26,11 +26,22 @@ use super::types::{DeckId, EngineState};
 const MAX_SAMPLE_BATCHES_PER_DECK_CALLBACK: usize = 1;
 const REBUFFER_TARGET_MS: u64 = 2_000;
 
+struct DeferredDeckLoad {
+    deck: DeckId,
+    meta: super::types::TrackMeta,
+    sample_rate: u32,
+    channels: u16,
+    norm_gain: f32,
+    sample_buffer: Vec<f32>,
+}
+
 /// Atomics shared between the audio callback and other threads.
 /// The audio callback WRITES, other threads READ.
 pub struct SharedAtomics {
     pub engine_state: Arc<AtomicU8>,
-    pub position_samples: Arc<AtomicU64>,
+    /// Active playback position in PCM frames, independent of source/output
+    /// channel-count differences.
+    pub position_frames: Arc<AtomicU64>,
     pub duration_ms: Arc<AtomicU64>,
     pub active_rating_key: Arc<AtomicI64>,
     pub device_sample_rate: Arc<AtomicU32>,
@@ -53,7 +64,7 @@ impl SharedAtomics {
     pub fn new() -> Self {
         Self {
             engine_state: Arc::new(AtomicU8::new(EngineState::Stopped.to_u8())),
-            position_samples: Arc::new(AtomicU64::new(0)),
+            position_frames: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
             active_rating_key: Arc::new(AtomicI64::new(0)),
             device_sample_rate: Arc::new(AtomicU32::new(44100)),
@@ -91,9 +102,12 @@ pub struct AudioCallbackState {
     pub crossfade_settings: CrossfadeSettings,
     pub ramp_cache: HashMap<i64, TrackRamps>,
     pub is_crossfading: bool,
-    /// Rating key of the track being faded OUT during crossfade.
-    /// Used by check_crossfade_complete to avoid resetting a newly preloaded deck.
+    /// Rating key of the track being faded out, retained until the overlap
+    /// completes so its end event and deck retirement target stay exact.
     crossfade_out_rk: i64,
+    crossfade_remaining_frames: u64,
+    crossfade_uses_curves: bool,
+    deferred_deck_load: Option<DeferredDeckLoad>,
     pub normalization_enabled: bool,
     paused: bool,
 
@@ -146,6 +160,9 @@ impl AudioCallbackState {
             ramp_cache: HashMap::new(),
             is_crossfading: false,
             crossfade_out_rk: 0,
+            crossfade_remaining_frames: 0,
+            crossfade_uses_curves: false,
+            deferred_deck_load: None,
             normalization_enabled: true,
             paused: false,
 
@@ -193,7 +210,8 @@ impl AudioCallbackState {
         data.fill(0.0);
 
         // 5. Mix decks (direct access, no lock)
-        if !self.paused && self.state() == EngineState::Playing {
+        let rendered_audio = !self.paused && self.state() == EngineState::Playing;
+        if rendered_audio {
             let (active, pending) = self.deck_mgr.both_decks_mut();
             mixer::mix_decks(
                 active,
@@ -202,6 +220,12 @@ impl AudioCallbackState {
                 self.device_channels,
                 self.is_crossfading,
             );
+        }
+        let output_frames = data.len() / usize::from(self.device_channels.max(1));
+        if self.is_crossfading && rendered_audio {
+            self.crossfade_remaining_frames = self
+                .crossfade_remaining_frames
+                .saturating_sub(output_frames as u64);
         }
 
         // 6. Process DSP chain (direct access, no lock)
@@ -218,7 +242,7 @@ impl AudioCallbackState {
         self.check_crossfade_complete();
 
         // 10. Handle duck-and-apply countdown
-        self.tick_duck();
+        self.tick_duck(output_frames as u32);
 
         // 11. Send visualizer data (~60fps)
         self.maybe_send_vis_frame(data);
@@ -229,8 +253,13 @@ impl AudioCallbackState {
     // -----------------------------------------------------------------------
 
     fn drain_sample_batches(&mut self) {
-        self.drain_deck_channel(&self.deck_a_rx.clone(), DeckId::A);
-        self.drain_deck_channel(&self.deck_b_rx.clone(), DeckId::B);
+        let deferred = self.deferred_deck_load.as_ref().map(|load| load.deck);
+        if deferred != Some(DeckId::A) {
+            self.drain_deck_channel(&self.deck_a_rx.clone(), DeckId::A);
+        }
+        if deferred != Some(DeckId::B) {
+            self.drain_deck_channel(&self.deck_b_rx.clone(), DeckId::B);
+        }
     }
 
     fn drain_deck_channel(&mut self, rx: &Receiver<SampleBatch>, deck_id: DeckId) {
@@ -281,7 +310,29 @@ impl AudioCallbackState {
                 norm_gain,
                 sample_buffer,
             } => {
-                self.handle_load_deck(deck, meta, sample_rate, channels, norm_gain, sample_buffer);
+                if self.is_crossfading && deck == self.deck_mgr.active_id().other() {
+                    let replacement = DeferredDeckLoad {
+                        deck,
+                        meta,
+                        sample_rate,
+                        channels,
+                        norm_gain,
+                        sample_buffer,
+                    };
+                    if let Some(retired) = self.deferred_deck_load.replace(replacement) {
+                        let _ = self.retired_buffer_tx.try_send(retired.sample_buffer);
+                    }
+                } else {
+                    self.handle_load_deck(
+                        deck,
+                        meta,
+                        sample_rate,
+                        channels,
+                        norm_gain,
+                        sample_buffer,
+                    );
+                    self.compute_and_set_schedule();
+                }
             }
             AudioCommand::Pause => {
                 self.paused = true;
@@ -301,6 +352,11 @@ impl AudioCallbackState {
                 self.scheduler.reset();
                 self.deck_mgr.stop_all();
                 self.is_crossfading = false;
+                self.crossfade_remaining_frames = 0;
+                self.crossfade_uses_curves = false;
+                if let Some(retired) = self.deferred_deck_load.take() {
+                    let _ = self.retired_buffer_tx.try_send(retired.sample_buffer);
+                }
                 self.paused = false;
                 self.set_state(EngineState::Stopped);
                 let _ = self.event_tx.try_send(EngineEvent::State {
@@ -404,15 +460,66 @@ impl AudioCallbackState {
             }
             AudioCommand::SetNormalization(enabled) => {
                 self.normalization_enabled = enabled;
-                // Update active deck's norm_gain
-                let active = self.deck_mgr.active_deck_mut();
-                if let Some(ref meta) = active.meta {
-                    active.norm_gain = if enabled {
-                        meta.gain_db.map_or(1.0, |db| 10.0_f32.powf(db / 20.0))
+                // Apply the change to the audible and already-preloaded decks.
+                for deck in [&mut self.deck_mgr.deck_a, &mut self.deck_mgr.deck_b] {
+                    if let Some(ref meta) = deck.meta {
+                        deck.norm_gain = if enabled {
+                            meta.gain_db.map_or(1.0, |db| 10.0_f32.powf(db / 20.0))
+                        } else {
+                            1.0
+                        };
+                    }
+                }
+                if let Some(load) = self.deferred_deck_load.as_mut() {
+                    load.norm_gain = if enabled {
+                        load.meta.gain_db.map_or(1.0, |db| 10.0_f32.powf(db / 20.0))
                     } else {
                         1.0
                     };
                 }
+            }
+            AudioCommand::UpdateTrackAnalysis {
+                rating_key,
+                gain_db,
+                intro_end_ms,
+                outro_start_ms,
+                fade_start_ms,
+                silence_start_ms,
+            } => {
+                for deck in [&mut self.deck_mgr.deck_a, &mut self.deck_mgr.deck_b] {
+                    if deck.rating_key() != rating_key {
+                        continue;
+                    }
+                    if let Some(meta) = deck.meta.as_mut() {
+                        meta.gain_db = gain_db;
+                        meta.intro_end_ms = intro_end_ms;
+                        meta.outro_start_ms = outro_start_ms;
+                        meta.fade_start_ms = fade_start_ms;
+                        meta.silence_start_ms = silence_start_ms;
+                    }
+                    deck.norm_gain = if self.normalization_enabled {
+                        gain_db.map_or(1.0, |db| 10.0_f32.powf(db / 20.0))
+                    } else {
+                        1.0
+                    };
+                }
+                if let Some(load) = self
+                    .deferred_deck_load
+                    .as_mut()
+                    .filter(|load| load.meta.rating_key == rating_key)
+                {
+                    load.meta.gain_db = gain_db;
+                    load.meta.intro_end_ms = intro_end_ms;
+                    load.meta.outro_start_ms = outro_start_ms;
+                    load.meta.fade_start_ms = fade_start_ms;
+                    load.meta.silence_start_ms = silence_start_ms;
+                    load.norm_gain = if self.normalization_enabled {
+                        gain_db.map_or(1.0, |db| 10.0_f32.powf(db / 20.0))
+                    } else {
+                        1.0
+                    };
+                }
+                self.compute_and_set_schedule();
             }
             AudioCommand::UpdateCrossfadeSettings(settings) => {
                 self.crossfade_settings = settings;
@@ -427,6 +534,7 @@ impl AudioCallbackState {
                         self.ramp_cache.remove(&key);
                     }
                 }
+                self.compute_and_set_schedule();
             }
             AudioCommand::SetVisualizerEnabled(enabled) => {
                 self.vis_enabled = enabled;
@@ -473,6 +581,20 @@ impl AudioCallbackState {
         };
     }
 
+    fn install_deferred_deck_load(&mut self) {
+        let Some(load) = self.deferred_deck_load.take() else {
+            return;
+        };
+        self.handle_load_deck(
+            load.deck,
+            load.meta,
+            load.sample_rate,
+            load.channels,
+            load.norm_gain,
+            load.sample_buffer,
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Transition (swap pending → active)
     // -----------------------------------------------------------------------
@@ -515,6 +637,7 @@ impl AudioCallbackState {
             self.crossfade_out_rk = self.deck_mgr.active_deck().rating_key();
             self.swap_decks();
             self.is_crossfading = true;
+            self.begin_crossfade(&plan);
 
             let (active, old) = self.deck_mgr.both_decks_mut();
             apply_fade_start(active, old, &plan);
@@ -539,6 +662,8 @@ impl AudioCallbackState {
             let new_dur = active.meta.as_ref().map_or(0, |m| m.duration_ms);
 
             self.is_crossfading = false;
+            self.crossfade_remaining_frames = 0;
+            self.crossfade_uses_curves = false;
             self.set_state(EngineState::Playing);
             let _ = self.event_tx.try_send(EngineEvent::TrackStarted {
                 rating_key: new_rk,
@@ -579,15 +704,21 @@ impl AudioCallbackState {
                 }
             }
         } else if active.is_finished() && !self.is_crossfading {
-            // Track ended naturally without a scheduled transition
-            let rk = active.rating_key();
-            let _ = self
-                .event_tx
-                .try_send(EngineEvent::TrackEnded { rating_key: rk });
-            self.set_state(EngineState::Stopped);
-            let _ = self.event_tx.try_send(EngineEvent::State {
-                state: "stopped".into(),
-            });
+            // Metadata duration can differ slightly from the decoded PCM
+            // length. If the exact scheduled point was missed, preserve the
+            // prepared next track instead of stopping at the end of this one.
+            if self.deck_mgr.pending_deck().loaded {
+                self.handle_gapless_transition();
+            } else {
+                let rk = active.rating_key();
+                let _ = self
+                    .event_tx
+                    .try_send(EngineEvent::TrackEnded { rating_key: rk });
+                self.set_state(EngineState::Stopped);
+                let _ = self.event_tx.try_send(EngineEvent::State {
+                    state: "stopped".into(),
+                });
+            }
         } else if active.loaded
             && !active.fully_decoded
             && !active.samples.is_empty()
@@ -634,6 +765,7 @@ impl AudioCallbackState {
             self.crossfade_out_rk = self.deck_mgr.active_deck().rating_key();
             self.swap_decks();
             self.is_crossfading = true;
+            self.begin_crossfade(&plan);
 
             let (active, old) = self.deck_mgr.both_decks_mut();
             apply_fade_start(active, old, &plan);
@@ -685,7 +817,8 @@ impl AudioCallbackState {
             return;
         }
 
-        // Check if both fade curves are done (or None for MixRamp)
+        // Timed/boundary fades complete when their curves do. MixRamp has no
+        // curves, so retain the outgoing deck for the plan's explicit overlap.
         let active_done = self
             .deck_mgr
             .active_deck()
@@ -699,13 +832,20 @@ impl AudioCallbackState {
             .as_ref()
             .is_none_or(|c| c.is_finished());
 
-        if active_done && pending_done {
+        let complete = if self.crossfade_uses_curves {
+            active_done && pending_done
+        } else {
+            self.crossfade_remaining_frames == 0
+        };
+
+        if complete {
             self.is_crossfading = false;
 
             let pending_rk = self.deck_mgr.pending_deck().rating_key();
 
-            // Only reset the pending deck if it still holds the fading-out track.
-            // A preload may have replaced it during the crossfade — don't nuke it.
+            // The outgoing deck normally remains pending until this point.
+            // Keep the identity check defensive in case a future transition
+            // path changes deck roles before cleanup.
             if pending_rk == self.crossfade_out_rk || pending_rk == 0 {
                 if self.crossfade_out_rk != 0 {
                     let _ = self.event_tx.try_send(EngineEvent::TrackEnded {
@@ -716,8 +856,12 @@ impl AudioCallbackState {
             }
 
             self.crossfade_out_rk = 0;
+            self.crossfade_remaining_frames = 0;
+            self.crossfade_uses_curves = false;
             self.deck_mgr.active_deck_mut().fade_gain = 1.0;
             self.deck_mgr.active_deck_mut().fade_curve = None;
+            self.install_deferred_deck_load();
+            self.compute_and_set_schedule();
         }
     }
 
@@ -747,8 +891,9 @@ impl AudioCallbackState {
     fn update_position_atomics(&self) {
         let active = self.deck_mgr.active_deck();
         if active.loaded {
-            let pos = (active.sample_offset + active.position) as u64;
-            self.atomics.position_samples.store(pos, Ordering::Relaxed);
+            let pos =
+                (active.sample_offset + active.position) as u64 / u64::from(active.channels.max(1));
+            self.atomics.position_frames.store(pos, Ordering::Relaxed);
             let dur = active.meta.as_ref().map_or(0, |m| m.duration_ms);
             self.atomics.duration_ms.store(dur, Ordering::Relaxed);
             self.atomics
@@ -761,11 +906,10 @@ impl AudioCallbackState {
     // Duck-and-apply
     // -----------------------------------------------------------------------
 
-    fn tick_duck(&mut self) {
+    fn tick_duck(&mut self, processed_frames: u32) {
         if self.duck_remaining_frames > 0 {
-            let frames_in_buffer = (self.device_channels as u32).max(1);
             self.duck_remaining_frames =
-                self.duck_remaining_frames.saturating_sub(frames_in_buffer);
+                self.duck_remaining_frames.saturating_sub(processed_frames);
             if self.duck_remaining_frames == 0 {
                 if let Some(vol) = self.duck_saved_volume.take() {
                     self.dsp_chain.set_volume(vol);
@@ -823,8 +967,9 @@ impl AudioCallbackState {
             .active_rating_key
             .store(new_rk, Ordering::Relaxed);
         if active.loaded {
-            let pos = (active.sample_offset + active.position) as u64;
-            self.atomics.position_samples.store(pos, Ordering::Relaxed);
+            let pos =
+                (active.sample_offset + active.position) as u64 / u64::from(active.channels.max(1));
+            self.atomics.position_frames.store(pos, Ordering::Relaxed);
             let dur = active.meta.as_ref().map_or(0, |m| m.duration_ms);
             self.atomics.duration_ms.store(dur, Ordering::Relaxed);
         }
@@ -842,8 +987,20 @@ impl AudioCallbackState {
         }
     }
 
+    fn begin_crossfade(&mut self, plan: &TransitionPlan) {
+        self.crossfade_remaining_frames =
+            (plan.duration_sec * self.device_sample_rate as f32).ceil() as u64;
+        self.crossfade_uses_curves = plan.fade_in_curve.is_some() || plan.fade_out_curve.is_some();
+    }
+
     fn compute_and_set_schedule(&mut self) {
         self.scheduler.reset();
+        // During an overlap the physical pending deck is the outgoing track,
+        // not the next queue item. Scheduling against it would create a
+        // backwards transition. Completion installs N+2 and re-arms then.
+        if self.is_crossfading {
+            return;
+        }
 
         let active = self.deck_mgr.active_deck();
         let pending = self.deck_mgr.pending_deck();
@@ -892,6 +1049,9 @@ impl AudioCallbackState {
             in_parent_key: pending.parent_key().to_string(),
             out_end_ramp: out_ramps.map(|r| r.end_ramp.clone()),
             in_start_ramp: in_ramps.map(|r| r.start_ramp.clone()),
+            out_outro_start_ms: active.meta.as_ref().and_then(|meta| meta.outro_start_ms),
+            out_fade_start_ms: active.meta.as_ref().and_then(|meta| meta.fade_start_ms),
+            out_silence_start_ms: active.meta.as_ref().and_then(|meta| meta.silence_start_ms),
             crossfade_window_ms: self.crossfade_settings.crossfade_window_ms,
             smart_crossfade_max_ms: self.crossfade_settings.smart_crossfade_max_ms,
             mixramp_db: self.crossfade_settings.mixramp_db,
@@ -936,5 +1096,280 @@ fn apply_fade_start(new_active: &mut DeckState, old_active: &mut DeckState, plan
         new_active.fade_curve = None;
         old_active.fade_gain = 1.0;
         old_active.fade_curve = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossbeam_channel::{bounded, unbounded};
+
+    fn callback() -> (AudioCallbackState, Receiver<EngineEvent>) {
+        let (_cmd_tx, cmd_rx) = unbounded();
+        let (_deck_a_tx, deck_a_rx) = unbounded();
+        let (_deck_b_tx, deck_b_rx) = unbounded();
+        let (event_tx, event_rx) = unbounded();
+        let (vis_tx, _vis_rx) = bounded(1);
+        let (vis_recycle_tx, vis_recycle_rx) = bounded(1);
+        let (retired_buffer_tx, _retired_buffer_rx) = unbounded();
+        (
+            AudioCallbackState::new(
+                cmd_rx,
+                deck_a_rx,
+                deck_b_rx,
+                event_tx,
+                vis_tx,
+                vis_recycle_tx,
+                vis_recycle_rx,
+                retired_buffer_tx,
+                Arc::new(SharedAtomics::new()),
+            ),
+            event_rx,
+        )
+    }
+
+    fn meta(
+        rating_key: i64,
+        duration_ms: u64,
+        parent_key: &str,
+        gain_db: f32,
+    ) -> super::super::types::TrackMeta {
+        super::super::types::TrackMeta {
+            rating_key,
+            duration_ms,
+            parent_key: parent_key.into(),
+            gain_db: Some(gain_db),
+            skip_crossfade: false,
+            start_ramp: None,
+            end_ramp: None,
+            intro_end_ms: None,
+            outro_start_ms: None,
+            fade_start_ms: None,
+            silence_start_ms: None,
+        }
+    }
+
+    fn load(
+        callback: &mut AudioCallbackState,
+        deck: DeckId,
+        track: super::super::types::TrackMeta,
+        sample_rate: u32,
+        channels: u16,
+        samples: Vec<f32>,
+    ) {
+        callback.handle_command(AudioCommand::LoadDeck {
+            deck,
+            meta: track,
+            sample_rate,
+            channels,
+            norm_gain: 1.0,
+            sample_buffer: samples,
+        });
+    }
+
+    #[test]
+    fn loading_pending_deck_arms_crossfade_schedule() {
+        let (mut callback, _) = callback();
+        callback.crossfade_settings = CrossfadeSettings {
+            crossfade_window_ms: 4_000,
+            smart_crossfade: false,
+            ..CrossfadeSettings::default()
+        };
+        load(
+            &mut callback,
+            DeckId::B,
+            meta(1, 10_000, "album:1", 0.0),
+            10,
+            2,
+            vec![0.0; 200],
+        );
+        callback.handle_transition_to_active(true);
+        load(
+            &mut callback,
+            DeckId::A,
+            meta(2, 10_000, "album:2", 0.0),
+            10,
+            2,
+            vec![0.0; 200],
+        );
+
+        assert!(callback.scheduler.check(5.99, 10.0).is_none());
+        assert_eq!(
+            callback.scheduler.check(6.0, 10.0),
+            Some(SchedulerAction::TransitionPoint)
+        );
+    }
+
+    #[test]
+    fn normalization_toggle_updates_active_and_preloaded_decks() {
+        let (mut callback, _) = callback();
+        load(
+            &mut callback,
+            DeckId::A,
+            meta(1, 10_000, "album:1", -6.0),
+            10,
+            2,
+            Vec::new(),
+        );
+        load(
+            &mut callback,
+            DeckId::B,
+            meta(2, 10_000, "album:2", -12.0),
+            10,
+            2,
+            Vec::new(),
+        );
+
+        callback.handle_command(AudioCommand::SetNormalization(false));
+        assert_eq!(callback.deck_mgr.deck_a.norm_gain, 1.0);
+        assert_eq!(callback.deck_mgr.deck_b.norm_gain, 1.0);
+
+        callback.handle_command(AudioCommand::SetNormalization(true));
+        assert!((callback.deck_mgr.deck_a.norm_gain - 10.0_f32.powf(-6.0 / 20.0)).abs() < 1e-6);
+        assert!((callback.deck_mgr.deck_b.norm_gain - 10.0_f32.powf(-12.0 / 20.0)).abs() < 1e-6);
+
+        callback.handle_command(AudioCommand::UpdateTrackAnalysis {
+            rating_key: 1,
+            gain_db: Some(-3.0),
+            intro_end_ms: None,
+            outro_start_ms: Some(8_000),
+            fade_start_ms: Some(9_000),
+            silence_start_ms: Some(9_800),
+        });
+        assert!((callback.deck_mgr.deck_a.norm_gain - 10.0_f32.powf(-3.0 / 20.0)).abs() < 1e-6);
+        assert_eq!(
+            callback.deck_mgr.deck_a.meta.as_ref().unwrap().gain_db,
+            Some(-3.0)
+        );
+        assert!((callback.deck_mgr.deck_b.norm_gain - 10.0_f32.powf(-12.0 / 20.0)).abs() < 1e-6);
+        assert!(callback.scheduler.check(8.99, 10.0).is_none());
+        assert_eq!(
+            callback.scheduler.check(9.0, 10.0),
+            Some(SchedulerAction::TransitionPoint)
+        );
+    }
+
+    #[test]
+    fn next_preload_waits_until_outgoing_crossfade_deck_is_retired() {
+        let (mut callback, _) = callback();
+        callback.device_sample_rate = 10;
+        callback.device_channels = 2;
+        load(
+            &mut callback,
+            DeckId::B,
+            meta(1, 100_000, "album:1", 0.0),
+            10,
+            2,
+            vec![0.25; 2_000],
+        );
+        callback.handle_transition_to_active(true);
+        load(
+            &mut callback,
+            DeckId::A,
+            meta(2, 100_000, "album:2", 0.0),
+            10,
+            2,
+            vec![0.25; 2_000],
+        );
+        callback.handle_transition_to_active(true);
+        assert!(callback.is_crossfading);
+
+        load(
+            &mut callback,
+            DeckId::B,
+            meta(3, 100_000, "album:3", 0.0),
+            10,
+            2,
+            Vec::new(),
+        );
+        assert_eq!(callback.deck_mgr.pending_deck().rating_key(), 1);
+        callback.handle_command(AudioCommand::UpdateTrackAnalysis {
+            rating_key: 3,
+            gain_db: Some(-6.0),
+            intro_end_ms: None,
+            outro_start_ms: Some(90_000),
+            fade_start_ms: Some(95_000),
+            silence_start_ms: Some(99_000),
+        });
+
+        callback.process_callback(&mut [0.0; 8]);
+        assert!(callback.is_crossfading);
+        assert_eq!(callback.deck_mgr.pending_deck().rating_key(), 1);
+
+        callback.process_callback(&mut [0.0; 4]);
+        assert!(!callback.is_crossfading);
+        assert_eq!(callback.deck_mgr.pending_deck().rating_key(), 3);
+        assert!(
+            (callback.deck_mgr.pending_deck().norm_gain - 10.0_f32.powf(-6.0 / 20.0)).abs() < 1e-6
+        );
+        assert_eq!(
+            callback
+                .deck_mgr
+                .pending_deck()
+                .meta
+                .as_ref()
+                .unwrap()
+                .fade_start_ms,
+            Some(95_000)
+        );
+    }
+
+    #[test]
+    fn published_position_uses_source_frames_not_output_channel_count() {
+        let (mut callback, _) = callback();
+        callback.device_sample_rate = 10;
+        callback.device_channels = 2;
+        load(
+            &mut callback,
+            DeckId::B,
+            meta(1, 1_000, "album:1", 0.0),
+            10,
+            6,
+            vec![0.0; 60],
+        );
+        callback.handle_transition_to_active(true);
+
+        callback.process_callback(&mut [0.0; 4]);
+
+        assert_eq!(callback.atomics.position_frames.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn decoded_end_uses_preloaded_track_when_metadata_duration_runs_long() {
+        let (mut callback, event_rx) = callback();
+        callback.device_sample_rate = 10;
+        callback.device_channels = 2;
+        load(
+            &mut callback,
+            DeckId::B,
+            meta(1, 1_100, "album:1", 0.0),
+            10,
+            2,
+            vec![0.0; 20],
+        );
+        callback.handle_transition_to_active(true);
+        callback.deck_mgr.active_deck_mut().fully_decoded = true;
+        load(
+            &mut callback,
+            DeckId::A,
+            meta(2, 1_000, "album:2", 0.0),
+            10,
+            2,
+            vec![0.0; 20],
+        );
+        callback.handle_command(AudioCommand::UpdateCrossfadeSettings(CrossfadeSettings {
+            crossfade_window_ms: 0,
+            smart_crossfade: false,
+            smart_crossfade_max_ms: 0,
+            ..CrossfadeSettings::default()
+        }));
+
+        callback.process_callback(&mut [0.0; 20]);
+
+        assert_eq!(callback.deck_mgr.active_deck().rating_key(), 2);
+        assert_eq!(callback.state(), EngineState::Playing);
+        assert!(event_rx
+            .try_iter()
+            .any(|event| matches!(event, EngineEvent::TrackEnded { rating_key: 1 })));
     }
 }

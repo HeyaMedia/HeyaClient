@@ -27,7 +27,6 @@ pub fn generate_fade_in(steps: usize, end_gain: f32) -> Vec<f32> {
 }
 
 /// Generate a linear fade-out curve.
-#[cfg(test)]
 pub fn generate_linear_fade_out(steps: usize, start_gain: f32) -> Vec<f32> {
     let steps = steps.max(2);
     let mut curve = Vec::with_capacity(steps);

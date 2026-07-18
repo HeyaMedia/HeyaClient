@@ -102,4 +102,8 @@ pub struct TrackMeta {
     pub skip_crossfade: bool,
     pub start_ramp: Option<String>,
     pub end_ramp: Option<String>,
+    pub intro_end_ms: Option<u64>,
+    pub outro_start_ms: Option<u64>,
+    pub fade_start_ms: Option<u64>,
+    pub silence_start_ms: Option<u64>,
 }

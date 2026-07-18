@@ -69,6 +69,15 @@ export interface NativeAudioTrackRequest {
   channels?: number
   lossless?: boolean
   gainDb?: number
+  skipCrossfade?: boolean
+  /** Plex MixRamp prolog metadata: "db seconds;db seconds;...". */
+  startRamp?: string
+  /** Plex MixRamp epilog metadata: "db seconds;db seconds;...". */
+  endRamp?: string
+  introEndMs?: number
+  outroStartMs?: number
+  fadeStartMs?: number
+  silenceStartMs?: number
   media: {
     mediaUrl: string
     playbackGrant: string
@@ -113,6 +122,15 @@ export type NativeAudioCommand = {
   | { type: 'setVolume'; volume: number }
   | { type: 'setMuted'; muted: boolean }
   | { type: 'updateProcessing'; settings: NativeAudioProcessingSettings }
+  | {
+      type: 'updateTrackAnalysis'
+      trackId: number
+      gainDb?: number | null
+      introEndMs?: number | null
+      outroStartMs?: number | null
+      fadeStartMs?: number | null
+      silenceStartMs?: number | null
+    }
   | { type: 'stop' }
 )
 

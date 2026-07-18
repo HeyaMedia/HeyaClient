@@ -22,7 +22,6 @@ pub enum SchedulerAction {
 pub struct Scheduler {
     mode: SchedulerMode,
     transition_time_sec: f32,
-    gapless_lead_time_sec: f32,
     fired: bool,
 }
 
@@ -31,7 +30,6 @@ impl Scheduler {
         Self {
             mode: SchedulerMode::Gapless,
             transition_time_sec: -1.0,
-            gapless_lead_time_sec: 0.1, // 100ms lead time
             fired: false,
         }
     }
@@ -58,7 +56,7 @@ impl Scheduler {
 
     /// Check if the transition should fire at the given position.
     /// Returns `Some(action)` if the trigger point was crossed, `None` otherwise.
-    pub fn check(&mut self, current_time_sec: f32, duration_sec: f32) -> Option<SchedulerAction> {
+    pub fn check(&mut self, current_time_sec: f32, _duration_sec: f32) -> Option<SchedulerAction> {
         if self.fired || self.transition_time_sec < 0.0 {
             return None;
         }
@@ -73,8 +71,7 @@ impl Scheduler {
                 }
             }
             SchedulerMode::Gapless => {
-                let trigger = duration_sec - self.gapless_lead_time_sec;
-                if trigger > 0.0 && current_time_sec >= trigger {
+                if self.transition_time_sec > 0.0 && current_time_sec >= self.transition_time_sec {
                     self.fired = true;
                     Some(SchedulerAction::GaplessPoint)
                 } else {
@@ -119,8 +116,8 @@ mod tests {
         s.set_transition_point(300.0); // duration
 
         assert!(s.check(298.0, 300.0).is_none());
-        // 300 - 0.1 = 299.9
-        assert_eq!(s.check(299.95, 300.0), Some(SchedulerAction::GaplessPoint));
+        assert!(s.check(299.95, 300.0).is_none());
+        assert_eq!(s.check(300.0, 300.0), Some(SchedulerAction::GaplessPoint));
     }
 
     #[test]

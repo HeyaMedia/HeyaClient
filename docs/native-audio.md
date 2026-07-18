@@ -31,6 +31,16 @@ software volume. The EQ card's equalizer/crossfeed order is preserved. Shared
 output supports CPAL's integer and floating-point device formats, with browser
 playback retained as the startup fallback.
 
+Smart crossfade consumes the same server-analyzed outro, natural-fade, and
+silence boundaries as WebAudio. A detected natural fade uses a linear outgoing
+curve; other transitions use equal-power curves, with MixRamp and the configured
+timed duration retained as fallbacks. Album-aware mode suppresses those overlaps
+between consecutive tracks from the same album. ReplayGain policy remains
+Heya-owned: Heya resolves track versus album loudness and true-peak headroom,
+then passes the resulting per-track gain to both native decks. If loudness or
+boundary analysis arrives after loading, a narrow track-analysis command updates
+the matching deck and re-arms its transition without restarting playback.
+
 HeyaClient enumerates CPAL output devices and exposes only normalized stable
 IDs, display labels, and the system-default flag through the audio bridge. A
 specific processed-mode output can be selected from Heya's Output tab; the

@@ -37,6 +37,9 @@ pub struct CrossfadeParams {
     pub in_parent_key: String,
     pub out_end_ramp: Option<Vec<RampPoint>>,
     pub in_start_ramp: Option<Vec<RampPoint>>,
+    pub out_outro_start_ms: Option<u64>,
+    pub out_fade_start_ms: Option<u64>,
+    pub out_silence_start_ms: Option<u64>,
     pub crossfade_window_ms: u32,
     pub smart_crossfade_max_ms: u32,
     pub mixramp_db: f32,
@@ -58,7 +61,8 @@ pub fn parse_ramp(raw: Option<&str>) -> Vec<RampPoint> {
             let mut parts = pair.split_whitespace();
             let db: f32 = parts.next()?.parse().ok()?;
             let time: f32 = parts.next()?.parse().ok()?;
-            Some(RampPoint { db, time_sec: time })
+            (db.is_finite() && time.is_finite() && time >= 0.0)
+                .then_some(RampPoint { db, time_sec: time })
         })
         .collect()
 }
@@ -114,7 +118,7 @@ mod tests {
 
     #[test]
     fn parse_ramp_malformed_pair_skipped() {
-        let ramp = parse_ramp(Some("-10 0.5;garbage;-5 1.0"));
+        let ramp = parse_ramp(Some("-10 0.5;garbage;NaN 0.8;-5 -1;-5 1.0"));
         assert_eq!(ramp.len(), 2);
     }
 }

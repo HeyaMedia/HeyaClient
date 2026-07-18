@@ -15,6 +15,7 @@ const EQ_FREQS: [f64; NUM_BANDS] = [
 
 pub struct Equalizer {
     enabled: bool,
+    gains_db: [f32; NUM_BANDS],
     filters: [BiquadFilter; NUM_BANDS],
 }
 
@@ -30,13 +31,19 @@ impl Equalizer {
         });
         Self {
             enabled: false,
+            gains_db: [0.0; NUM_BANDS],
             filters,
         }
     }
 
     /// Set all 10 band gains at once (in dB).
     pub fn set_gains(&mut self, gains_db: &[f32; NUM_BANDS]) {
-        for (filter, &db) in self.filters.iter_mut().zip(gains_db.iter()) {
+        self.gains_db = *gains_db;
+        self.apply_gains();
+    }
+
+    fn apply_gains(&mut self) {
+        for (filter, &db) in self.filters.iter_mut().zip(self.gains_db.iter()) {
             filter.set_gain_db(if self.enabled { db as f64 } else { 0.0 });
         }
     }
@@ -58,7 +65,11 @@ impl Equalizer {
 
 impl DspBlock for Equalizer {
     fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
+        if self.enabled != enabled {
+            self.enabled = enabled;
+            self.apply_gains();
+            self.reset();
+        }
     }
 
     fn process(&mut self, samples: &mut [f32], _sample_rate: u32, channels: u16) {
@@ -135,5 +146,23 @@ mod tests {
             boosted_energy > orig_energy * 2.0,
             "bass boost should increase 50Hz energy"
         );
+    }
+
+    #[test]
+    fn gains_set_while_disabled_take_effect_when_enabled() {
+        let mut eq = Equalizer::new(44100);
+        let mut gains = [0.0f32; NUM_BANDS];
+        gains[0] = 12.0;
+        gains[1] = 12.0;
+        eq.set_gains(&gains);
+        eq.set_enabled(true);
+
+        let mut samples: Vec<f32> = (0..44100)
+            .map(|i| (2.0 * std::f32::consts::PI * 50.0 * i as f32 / 44100.0).sin())
+            .collect();
+        let before = samples.iter().map(|sample| sample * sample).sum::<f32>();
+        eq.process(&mut samples, 44100, 1);
+        let after = samples.iter().map(|sample| sample * sample).sum::<f32>();
+        assert!(after > before * 2.0);
     }
 }

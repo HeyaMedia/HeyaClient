@@ -32,6 +32,12 @@ pub enum EngineEvent {
     Error {
         message: String,
     },
+    /// A pending deck failed to prepare. Active playback remains authoritative
+    /// and the next explicit Play command can cold-load the track.
+    PreloadError {
+        rating_key: i64,
+        message: String,
+    },
     VisFrame {
         /// Time-domain samples (interleaved f32, but sent as Vec<f32> for serde).
         samples: Vec<f32>,

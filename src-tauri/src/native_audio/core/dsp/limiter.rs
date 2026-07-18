@@ -38,6 +38,10 @@ impl Limiter {
         self.update_coefficients(rate);
     }
 
+    pub fn reset(&mut self) {
+        self.envelope_db = -96.0;
+    }
+
     fn update_coefficients(&mut self, sample_rate: u32) {
         let sr = sample_rate as f32;
         // attack = 10ms, release = 100ms

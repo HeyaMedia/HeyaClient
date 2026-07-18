@@ -235,6 +235,7 @@ fn dispatch<R: Runtime>(
                 super::AudioCommand::SetVolume { .. } => "set_volume",
                 super::AudioCommand::SetMuted { .. } => "set_muted",
                 super::AudioCommand::UpdateProcessing { .. } => "update_processing",
+                super::AudioCommand::UpdateTrackAnalysis { .. } => "update_track_analysis",
                 super::AudioCommand::Stop => "stop",
             };
             log::info!(

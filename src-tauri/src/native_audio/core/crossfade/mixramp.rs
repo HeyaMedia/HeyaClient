@@ -65,7 +65,10 @@ pub fn compute_mixramp_transition(params: &CrossfadeParams) -> Option<Transition
     };
 
     let overlap_duration = end_overlap + start_overlap;
-    if overlap_duration < 0.2 {
+    if !overlap_duration.is_finite()
+        || end_overlap > params.out_duration_sec
+        || overlap_duration < 0.2
+    {
         return compute_timed_fallback(params);
     }
 
@@ -128,6 +131,9 @@ mod tests {
             in_parent_key: "b".into(),
             out_end_ramp: Some(make_ramp(&[(-30.0, 0.0), (-17.0, 1.5), (-5.0, 3.0)])),
             in_start_ramp: Some(make_ramp(&[(-30.0, 0.0), (-17.0, 0.8), (-5.0, 2.0)])),
+            out_outro_start_ms: None,
+            out_fade_start_ms: None,
+            out_silence_start_ms: None,
             crossfade_window_ms: 4000,
             smart_crossfade_max_ms: 20000,
             mixramp_db: -17.0,
@@ -152,6 +158,9 @@ mod tests {
             in_parent_key: "b".into(),
             out_end_ramp: None,
             in_start_ramp: None,
+            out_outro_start_ms: None,
+            out_fade_start_ms: None,
+            out_silence_start_ms: None,
             crossfade_window_ms: 4000,
             smart_crossfade_max_ms: 20000,
             mixramp_db: -17.0,

@@ -33,6 +33,14 @@ pub enum Command {
     SetNormalization {
         enabled: bool,
     },
+    UpdateTrackAnalysis {
+        rating_key: i64,
+        gain_db: Option<f32>,
+        intro_end_ms: Option<u64>,
+        outro_start_ms: Option<u64>,
+        fade_start_ms: Option<u64>,
+        silence_start_ms: Option<u64>,
+    },
 
     // -- DSP --
     SetPreampGain {
@@ -138,6 +146,14 @@ pub enum AudioCommand {
     SetCrossfeedBeforeEq(bool),
     ResetDsp,
     SetNormalization(bool),
+    UpdateTrackAnalysis {
+        rating_key: i64,
+        gain_db: Option<f32>,
+        intro_end_ms: Option<u64>,
+        outro_start_ms: Option<u64>,
+        fade_start_ms: Option<u64>,
+        silence_start_ms: Option<u64>,
+    },
 
     // -- Crossfade settings (for scheduler) --
     UpdateCrossfadeSettings(CrossfadeSettings),

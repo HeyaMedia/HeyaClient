@@ -145,6 +145,20 @@ pub struct AudioTrackLoadRequest {
     pub lossless: bool,
     #[serde(default)]
     pub gain_db: Option<f32>,
+    #[serde(default)]
+    pub skip_crossfade: bool,
+    #[serde(default)]
+    pub start_ramp: Option<String>,
+    #[serde(default)]
+    pub end_ramp: Option<String>,
+    #[serde(default)]
+    pub intro_end_ms: Option<u64>,
+    #[serde(default)]
+    pub outro_start_ms: Option<u64>,
+    #[serde(default)]
+    pub fade_start_ms: Option<u64>,
+    #[serde(default)]
+    pub silence_start_ms: Option<u64>,
     pub media: PlaybackLoadRequest,
 }
 
@@ -183,6 +197,20 @@ pub enum AudioCommand {
     UpdateProcessing {
         settings: AudioProcessingSettings,
     },
+    UpdateTrackAnalysis {
+        #[serde(rename = "trackId")]
+        track_id: i64,
+        #[serde(default, rename = "gainDb")]
+        gain_db: Option<f32>,
+        #[serde(default, rename = "introEndMs")]
+        intro_end_ms: Option<u64>,
+        #[serde(default, rename = "outroStartMs")]
+        outro_start_ms: Option<u64>,
+        #[serde(default, rename = "fadeStartMs")]
+        fade_start_ms: Option<u64>,
+        #[serde(default, rename = "silenceStartMs")]
+        silence_start_ms: Option<u64>,
+    },
     Stop,
 }
 
@@ -202,6 +230,35 @@ impl AudioCommand {
                 ))
             }
             Self::UpdateProcessing { settings } => settings.validate(),
+            Self::UpdateTrackAnalysis { track_id, .. } if *track_id <= 0 => {
+                Err(BridgeError::invalid_request("trackId must be positive"))
+            }
+            Self::UpdateTrackAnalysis {
+                gain_db: Some(gain),
+                ..
+            } if !gain.is_finite() || !(-60.0..=24.0).contains(gain) => Err(
+                BridgeError::invalid_request("normalization gain is invalid"),
+            ),
+            Self::UpdateTrackAnalysis {
+                intro_end_ms,
+                outro_start_ms,
+                fade_start_ms,
+                silence_start_ms,
+                ..
+            } if [
+                *intro_end_ms,
+                *outro_start_ms,
+                *fade_start_ms,
+                *silence_start_ms,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|boundary| boundary > 7 * 24 * 60 * 60 * 1_000) =>
+            {
+                Err(BridgeError::invalid_request(
+                    "crossfade boundary is invalid",
+                ))
+            }
             _ => Ok(()),
         }
     }
@@ -402,6 +459,27 @@ mod tests {
                 position_seconds: 148.05
             }
         );
+
+        let gain = serde_json::from_value::<AudioCommandRequest>(envelope(json!({
+            "type": "updateTrackAnalysis",
+            "trackId": 42,
+            "gainDb": -5.25,
+            "fadeStartMs": 195000,
+            "silenceStartMs": 199000
+        })))
+        .expect("a live ReplayGain update must decode");
+        assert_eq!(
+            gain.command,
+            AudioCommand::UpdateTrackAnalysis {
+                track_id: 42,
+                gain_db: Some(-5.25),
+                intro_end_ms: None,
+                outro_start_ms: None,
+                fade_start_ms: Some(195_000),
+                silence_start_ms: Some(199_000),
+            }
+        );
+        assert!(gain.command.validate().is_ok());
     }
 
     #[test]

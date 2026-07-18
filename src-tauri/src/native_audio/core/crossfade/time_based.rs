@@ -17,7 +17,10 @@ pub fn compute_timed_transition(params: &CrossfadeParams) -> Option<TransitionPl
         return None;
     }
 
-    let duration_sec = duration_ms as f32 / 1000.0;
+    let duration_sec = (duration_ms as f32 / 1000.0).min(params.out_duration_sec * 0.5);
+    if duration_sec <= 0.0 {
+        return None;
+    }
     let start_time = (params.out_duration_sec - duration_sec).max(0.0);
     let steps = steps_for_duration(duration_sec);
 
@@ -41,6 +44,9 @@ mod tests {
             in_parent_key: "b".into(),
             out_end_ramp: None,
             in_start_ramp: None,
+            out_outro_start_ms: None,
+            out_fade_start_ms: None,
+            out_silence_start_ms: None,
             crossfade_window_ms: 4000,
             smart_crossfade_max_ms: 20000,
             mixramp_db: -17.0,
@@ -66,6 +72,9 @@ mod tests {
             in_parent_key: "b".into(),
             out_end_ramp: None,
             in_start_ramp: None,
+            out_outro_start_ms: None,
+            out_fade_start_ms: None,
+            out_silence_start_ms: None,
             crossfade_window_ms: 4000,
             smart_crossfade_max_ms: 10000,
             mixramp_db: -17.0,
@@ -84,6 +93,9 @@ mod tests {
             in_parent_key: "b".into(),
             out_end_ramp: None,
             in_start_ramp: None,
+            out_outro_start_ms: None,
+            out_fade_start_ms: None,
+            out_silence_start_ms: None,
             crossfade_window_ms: 0,
             smart_crossfade_max_ms: 0,
             mixramp_db: -17.0,

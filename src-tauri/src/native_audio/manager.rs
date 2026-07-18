@@ -63,7 +63,16 @@ struct ActiveSession {
     state: NativeAudioState,
     processing: AudioProcessingSettings,
     command_results: HashMap<CommandId, AudioCommandResult>,
+    track_formats: HashMap<i64, TrackFormat>,
     unmuted_volume: f64,
+}
+
+#[derive(Clone, Copy)]
+struct TrackFormat {
+    source_sample_rate: u32,
+    source_channels: u16,
+    output_sample_rate: u32,
+    output_channels: u16,
 }
 
 #[derive(Default)]
@@ -247,6 +256,7 @@ impl NativeAudioManager {
                 state: state.clone(),
                 processing: load.processing,
                 command_results: HashMap::new(),
+                track_formats: HashMap::new(),
                 unmuted_volume: 1.0,
             });
         }
@@ -464,6 +474,21 @@ fn apply_command(active: &mut ActiveSession, command: AudioCommand) -> Result<()
             active.processing = settings;
             Ok(())
         }
+        AudioCommand::UpdateTrackAnalysis {
+            track_id,
+            gain_db,
+            intro_end_ms,
+            outro_start_ms,
+            fade_start_ms,
+            silence_start_ms,
+        } => active.engine.send(EngineCommand::UpdateTrackAnalysis {
+            rating_key: track_id,
+            gain_db,
+            intro_end_ms,
+            outro_start_ms,
+            fade_start_ms,
+            silence_start_ms,
+        }),
         AudioCommand::Stop => active.engine.send(EngineCommand::Stop),
     }
 }
@@ -510,11 +535,14 @@ fn configure_processing(
     };
     engine.send(EngineCommand::SetCrossfadeWindow { ms: crossfade_ms })?;
     engine.send(EngineCommand::SetSameAlbumCrossfade {
-        enabled: settings.album_aware,
+        // The public setting enables album-aware suppression. The core setting
+        // has the inverse meaning: whether same-album tracks may crossfade.
+        enabled: !settings.album_aware,
     })?;
     engine.send(EngineCommand::SetSmartCrossfade {
         enabled: settings.crossfade_mode == CrossfadeMode::Smart,
     })?;
+    engine.send(EngineCommand::SetSmartCrossfadeMax { ms: crossfade_ms })?;
     engine.send(EngineCommand::SetVisualizerEnabled {
         enabled: settings.visualizer_enabled,
     })
@@ -686,6 +714,9 @@ fn handle_engine_event(
                 }
                 active.state.ended = false;
                 active.state.termination_reason = None;
+                if let Some(format) = active.track_formats.get(&rating_key).copied() {
+                    apply_track_format(active, format);
+                }
             }
             EngineEvent::TrackEnded { rating_key } => {
                 active.state.ended_track_id = Some(rating_key);
@@ -703,32 +734,21 @@ fn handle_engine_event(
                 output_sample_rate,
                 output_channels,
             } => {
+                let format = TrackFormat {
+                    source_sample_rate,
+                    source_channels,
+                    output_sample_rate,
+                    output_channels,
+                };
+                active.track_formats.insert(rating_key, format);
+                if active.track_formats.len() > 8 {
+                    let current_track_id = active.state.current_track_id;
+                    active.track_formats.retain(|track_id, _| {
+                        Some(*track_id) == current_track_id || *track_id == rating_key
+                    });
+                }
                 if active.state.current_track_id == Some(rating_key) {
-                    active.state.source_sample_rate_hz = Some(source_sample_rate);
-                    active.state.source_channels = Some(source_channels);
-                    active.state.output_sample_rate_hz = Some(output_sample_rate);
-                    active.state.output_channels = Some(output_channels);
-                    active.state.resampler_active = source_sample_rate != output_sample_rate;
-                    if active.state.output_mode == AudioOutputMode::BitPerfect
-                        && (source_sample_rate != output_sample_rate
-                            || source_channels != output_channels)
-                    {
-                        // Metadata selected the exclusive device format before
-                        // decoding began. If the decoder proves that metadata
-                        // wrong, stop instead of resampling/upmixing while still
-                        // claiming a bit-perfect path.
-                        let _ = active.engine.send(EngineCommand::Stop);
-                        active.state.bit_perfect_active = false;
-                        active.state.playing = false;
-                        active.state.paused = true;
-                        active.state.loading = false;
-                        active.state.buffering = false;
-                        active.state.error = Some(PlaybackError {
-                            code: BridgeErrorCode::CommandFailed,
-                            message: "decoded source format did not match the requested exclusive output format".into(),
-                        });
-                        active.state.termination_reason = Some(TerminationReason::Failed);
-                    }
+                    apply_track_format(active, format);
                 }
             }
             EngineEvent::Error { message } => {
@@ -742,10 +762,48 @@ fn handle_engine_event(
                 });
                 active.state.termination_reason = Some(TerminationReason::Failed);
             }
+            EngineEvent::PreloadError {
+                rating_key,
+                message,
+            } => {
+                log::warn!(
+                    "native audio preload failed renderer={} track={rating_key}: {message}",
+                    renderer_session_id.as_str(),
+                );
+            }
             EngineEvent::VisFrame { .. } => unreachable!(),
         }
     }
     publish_state(shared, renderer_session_id);
+}
+
+fn apply_track_format(active: &mut ActiveSession, format: TrackFormat) {
+    active.state.source_sample_rate_hz = Some(format.source_sample_rate);
+    active.state.source_channels = Some(format.source_channels);
+    active.state.output_sample_rate_hz = Some(format.output_sample_rate);
+    active.state.output_channels = Some(format.output_channels);
+    active.state.resampler_active = format.source_sample_rate != format.output_sample_rate;
+    if active.state.output_mode == AudioOutputMode::BitPerfect
+        && (format.source_sample_rate != format.output_sample_rate
+            || format.source_channels != format.output_channels)
+    {
+        // Metadata selected the exclusive device format before decoding began.
+        // If decoding proves it wrong, stop rather than resampling/upmixing while
+        // claiming a bit-perfect path. Cached preload formats are rechecked when
+        // that track becomes active.
+        let _ = active.engine.send(EngineCommand::Stop);
+        active.state.bit_perfect_active = false;
+        active.state.playing = false;
+        active.state.paused = true;
+        active.state.loading = false;
+        active.state.buffering = false;
+        active.state.error = Some(PlaybackError {
+            code: BridgeErrorCode::CommandFailed,
+            message: "decoded source format did not match the requested exclusive output format"
+                .into(),
+        });
+        active.state.termination_reason = Some(TerminationReason::Failed);
+    }
 }
 
 fn publish_state(shared: &Shared, renderer_session_id: &RendererSessionId) {
