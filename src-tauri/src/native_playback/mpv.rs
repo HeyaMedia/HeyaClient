@@ -824,14 +824,21 @@ fn create_mpv(output: MpvOutput) -> Result<Mpv, EngineError> {
         initializer.set_option("config", false)?;
         initializer.set_option("load-scripts", false)?;
         // MPV 0.41 ships several built-in Lua scripts with independent load
-        // switches. Heya owns its controls and diagnostics, so none are
-        // needed; disabling them also keeps LuaJIT-generated executable pages
-        // out of the signed macOS application process.
+        // switches ("load-scripts" above only covers user scripts). Heya owns
+        // its controls and diagnostics, so none are needed; disabling them
+        // also keeps LuaJIT-generated executable pages out of the signed
+        // macOS application process, where the hardened runtime kills the
+        // process (SIGKILL, Code Signature Invalid) as soon as a JIT-compiled
+        // trace runs. Seeking repeatedly makes positioning.lua's handlers hot
+        // enough to trigger exactly that.
         initializer.set_option("load-auto-profiles", "no")?;
+        initializer.set_option("load-commands", false)?;
         initializer.set_option("load-console", false)?;
         initializer.set_option("load-context-menu", false)?;
+        initializer.set_option("load-positioning", false)?;
         initializer.set_option("load-select", false)?;
         initializer.set_option("load-stats-overlay", false)?;
+        initializer.set_option("osc", false)?;
         initializer.set_option("ytdl", false)?;
         initializer.set_option("terminal", false)?;
         initializer.set_option(

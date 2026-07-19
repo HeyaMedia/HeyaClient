@@ -5,5 +5,12 @@
   <!-- Required for loading the user's Homebrew/MacPorts libmpv at runtime. -->
   <key>com.apple.security.cs.disable-library-validation</key>
   <true/>
+  <!-- libmpv links LuaJIT for its built-in scripts. Every switch we know of
+       is disabled in mpv.rs, but new mpv releases add new built-in scripts
+       (0.40 added positioning/commands); without this, any that slip through
+       get the process killed (Code Signature Invalid) the moment LuaJIT
+       executes a JIT-compiled trace. -->
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
 </dict>
 </plist>
