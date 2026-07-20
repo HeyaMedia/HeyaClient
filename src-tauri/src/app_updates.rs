@@ -142,7 +142,12 @@ impl AppUpdater {
         app.restart();
 
         #[cfg(target_os = "windows")]
-        Ok(())
+        {
+            // The Windows installer relaunches the app itself — `app` only
+            // drives the in-process restart on the other platforms.
+            let _ = app;
+            Ok(())
+        }
     }
 
     pub(crate) async fn install_silent(&self, app: AppHandle) -> Result<(), String> {
