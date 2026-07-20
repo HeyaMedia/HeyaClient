@@ -5,7 +5,8 @@
 //! Rust validates the selected server origin plus every operation payload.
 
 use crate::{
-    native_audio, native_playback, navigation, server_profile::normalize_origin, system_media,
+    application, native_audio, native_playback, navigation, server_profile::normalize_origin,
+    system_media,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,12 +24,14 @@ pub const AUDIO_COMMAND: &str = "plugin:native-bridge|native_audio_request";
 pub const PLAYBACK_COMMAND: &str = "plugin:native-bridge|native_playback_request";
 pub const SYSTEM_MEDIA_COMMAND: &str = "plugin:native-bridge|system_media_request";
 pub const WINDOW_COMMAND: &str = "plugin:native-bridge|native_window_request";
+pub const APPLICATION_COMMAND: &str = "plugin:native-bridge|application_request";
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024;
 
 const AUDIO_PERMISSION: &str = "native-bridge:allow-native-audio-request";
 const PLAYBACK_PERMISSION: &str = "native-bridge:allow-native-playback-request";
 const SYSTEM_MEDIA_PERMISSION: &str = "native-bridge:allow-system-media-request";
 const WINDOW_PERMISSION: &str = "native-bridge:allow-native-window-request";
+const APPLICATION_PERMISSION: &str = "native-bridge:allow-application-request";
 #[cfg(not(target_os = "macos"))]
 const START_DRAGGING_PERMISSION: &str = "core:window:allow-start-dragging";
 #[cfg(not(target_os = "macos"))]
@@ -71,13 +74,14 @@ pub struct NativeBridgeAcl {
     origins: Mutex<HashSet<String>>,
 }
 
-pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
+pub fn plugin() -> TauriPlugin<tauri::Wry> {
     tauri::plugin::Builder::new(PLUGIN_NAME)
         .invoke_handler(tauri::generate_handler![
             native_audio_request,
             native_playback_request,
             system_media_request,
-            native_window_request
+            native_window_request,
+            application_request
         ])
         .build()
 }
@@ -133,6 +137,15 @@ fn system_media_request<R: Runtime>(
     system_media::handle_system_media_ipc(&app, &webview, request)
 }
 
+#[tauri::command]
+async fn application_request(
+    app: AppHandle,
+    webview: WebviewWindow,
+    request: NativeBridgeRequest,
+) -> native_playback::BridgeResponse<Value> {
+    application::handle_application_ipc(&app, &webview, request).await
+}
+
 /// Authorize only the selected Heya origin to call the semantic bridge
 /// commands. Previously authorized origins remain harmless after a server
 /// switch: top-level navigation rejects them and each command independently
@@ -160,7 +173,8 @@ pub fn authorize_origin<R: Runtime>(app: &AppHandle<R>, origin: &str) -> Result<
         .permission(AUDIO_PERMISSION)
         .permission(PLAYBACK_PERMISSION)
         .permission(SYSTEM_MEDIA_PERMISSION)
-        .permission(WINDOW_PERMISSION);
+        .permission(WINDOW_PERMISSION)
+        .permission(APPLICATION_PERMISSION);
 
     #[cfg(not(target_os = "macos"))]
     let capability = capability
@@ -176,7 +190,7 @@ pub fn authorize_origin<R: Runtime>(app: &AppHandle<R>, origin: &str) -> Result<
             origins.remove(&origin);
         }
         return Err(format!(
-            "could not authorize the selected Heya origin for native playback: {error}"
+            "could not authorize the selected Heya origin for native integrations: {error}"
         ));
     }
     Ok(())

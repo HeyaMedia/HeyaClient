@@ -3,9 +3,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Mutex,
 };
-#[cfg(not(debug_assertions))]
-use tauri::Manager;
-use tauri::{ipc::Channel, AppHandle, State, WebviewWindow};
+use tauri::AppHandle;
 use tauri_plugin_updater::{Update, UpdaterExt};
 
 #[derive(Default)]
@@ -58,7 +56,7 @@ impl Drop for OperationGuard<'_> {
 }
 
 impl AppUpdater {
-    fn status(&self, app: &AppHandle) -> UpdateStatus {
+    pub(crate) fn status(&self, app: &AppHandle) -> UpdateStatus {
         let pending = self
             .pending
             .lock()
@@ -74,7 +72,7 @@ impl AppUpdater {
         }
     }
 
-    async fn check(&self, app: &AppHandle) -> Result<UpdateStatus, String> {
+    pub(crate) async fn check(&self, app: &AppHandle) -> Result<UpdateStatus, String> {
         let _guard = OperationGuard::acquire(&self.checking, "check")?;
         if self.installing.load(Ordering::Acquire) {
             return Err("an update installation is already in progress".to_string());
@@ -92,113 +90,64 @@ impl AppUpdater {
             .unwrap_or_else(|error| error.into_inner()) = update;
         Ok(self.status(app))
     }
-}
 
-#[tauri::command]
-pub fn get_update_status(
-    app: AppHandle,
-    invoking_window: WebviewWindow,
-    updater: State<'_, AppUpdater>,
-) -> Result<UpdateStatus, String> {
-    ensure_settings_caller(&invoking_window)?;
-    Ok(updater.status(&app))
-}
+    async fn install_with_reporter<F>(&self, app: AppHandle, report: F) -> Result<(), String>
+    where
+        F: Fn(UpdateProgress) + Clone + Send + Sync + 'static,
+    {
+        let _guard = OperationGuard::acquire(&self.installing, "installation")?;
+        if self.checking.load(Ordering::Acquire) {
+            return Err("an update check is still in progress".to_string());
+        }
 
-#[tauri::command]
-pub async fn check_for_update(
-    app: AppHandle,
-    invoking_window: WebviewWindow,
-    updater: State<'_, AppUpdater>,
-) -> Result<UpdateStatus, String> {
-    ensure_settings_caller(&invoking_window)?;
-    updater.check(&app).await
-}
+        let update = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+            .ok_or_else(|| "check for an update before installing".to_string())?;
+        let version = update.version.clone();
+        let downloaded = AtomicU64::new(0);
+        report(UpdateProgress::Started {
+            version: version.clone(),
+        });
 
-#[tauri::command]
-pub async fn install_update(
-    _app: AppHandle,
-    invoking_window: WebviewWindow,
-    updater: State<'_, AppUpdater>,
-    on_event: Channel<UpdateProgress>,
-) -> Result<(), String> {
-    ensure_settings_caller(&invoking_window)?;
-    let _guard = OperationGuard::acquire(&updater.installing, "installation")?;
-    if updater.checking.load(Ordering::Acquire) {
-        return Err("an update check is still in progress".to_string());
+        let progress_reporter = report.clone();
+        let finished_reporter = report.clone();
+        update
+            .download_and_install(
+                |chunk_length, total_bytes| {
+                    let downloaded_bytes = downloaded
+                        .fetch_add(chunk_length as u64, Ordering::Relaxed)
+                        .saturating_add(chunk_length as u64);
+                    progress_reporter(UpdateProgress::Downloading {
+                        downloaded_bytes,
+                        total_bytes,
+                    });
+                },
+                move || finished_reporter(UpdateProgress::DownloadFinished),
+            )
+            .await
+            .map_err(|error| format!("could not install Heya {version}: {error}"))?;
+
+        *self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        report(UpdateProgress::Installed {
+            version: version.clone(),
+        });
+
+        #[cfg(not(target_os = "windows"))]
+        app.restart();
+
+        #[cfg(target_os = "windows")]
+        Ok(())
     }
 
-    let update = updater
-        .pending
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .clone()
-        .ok_or_else(|| "check for an update before installing".to_string())?;
-    let version = update.version.clone();
-    let downloaded = AtomicU64::new(0);
-    on_event
-        .send(UpdateProgress::Started {
-            version: version.clone(),
-        })
-        .map_err(|error| format!("could not report update progress: {error}"))?;
-
-    let progress_channel = on_event.clone();
-    let finished_channel = on_event.clone();
-    update
-        .download_and_install(
-            |chunk_length, total_bytes| {
-                let downloaded_bytes = downloaded
-                    .fetch_add(chunk_length as u64, Ordering::Relaxed)
-                    .saturating_add(chunk_length as u64);
-                let _ = progress_channel.send(UpdateProgress::Downloading {
-                    downloaded_bytes,
-                    total_bytes,
-                });
-            },
-            move || {
-                let _ = finished_channel.send(UpdateProgress::DownloadFinished);
-            },
-        )
-        .await
-        .map_err(|error| format!("could not install Heya {version}: {error}"))?;
-
-    *updater
-        .pending
-        .lock()
-        .unwrap_or_else(|error| error.into_inner()) = None;
-    let _ = on_event.send(UpdateProgress::Installed {
-        version: version.clone(),
-    });
-
-    #[cfg(not(target_os = "windows"))]
-    _app.restart();
-
-    #[cfg(target_os = "windows")]
-    Ok(())
-}
-
-fn ensure_settings_caller(window: &WebviewWindow) -> Result<(), String> {
-    crate::navigation::ensure_local_settings_window(window, "the updater")
-}
-
-pub fn check_on_startup(app: AppHandle) {
-    #[cfg(not(debug_assertions))]
-    tauri::async_runtime::spawn(async move {
-        let updater = app.state::<AppUpdater>();
-        match updater.check(&app).await {
-            Ok(status) if status.available => {
-                log::info!(
-                    "Heya {} is available; opening client settings",
-                    status.version.as_deref().unwrap_or("update")
-                );
-                crate::navigation::request_settings(&app);
-            }
-            Ok(_) => log::info!("HeyaClient is up to date"),
-            Err(error) => log::warn!("automatic update check failed: {error}"),
-        }
-    });
-
-    #[cfg(debug_assertions)]
-    let _ = app;
+    pub(crate) async fn install_silent(&self, app: AppHandle) -> Result<(), String> {
+        self.install_with_reporter(app, |_| {}).await
+    }
 }
 
 #[cfg(test)]

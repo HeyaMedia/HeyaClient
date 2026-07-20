@@ -1,5 +1,6 @@
 #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
 mod app_updates;
+mod application;
 pub mod native_audio;
 mod native_bridge;
 pub mod native_playback;
@@ -16,23 +17,23 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
 
 #[derive(Serialize)]
-struct NativePlaybackStatus {
-    backend: &'static str,
-    available: bool,
-    build_includes_native_mpv: bool,
-    video_surface: native_playback::NativeVideoSurface,
-    unavailable_reason: Option<native_playback::BridgeErrorCode>,
-    installation: native_playback::MpvInstallationOffer,
+pub(crate) struct NativePlaybackStatus {
+    pub(crate) backend: &'static str,
+    pub(crate) available: bool,
+    pub(crate) build_includes_native_mpv: bool,
+    pub(crate) video_surface: native_playback::NativeVideoSurface,
+    pub(crate) unavailable_reason: Option<native_playback::BridgeErrorCode>,
+    pub(crate) installation: native_playback::MpvInstallationOffer,
 }
 
 #[derive(Serialize)]
-struct NativeAudioStatus {
-    backend: &'static str,
-    available: bool,
-    gapless: bool,
-    crossfade: bool,
-    bit_perfect_available: bool,
-    bit_perfect_unavailable_reason: Option<&'static str>,
+pub(crate) struct NativeAudioStatus {
+    pub(crate) backend: &'static str,
+    pub(crate) available: bool,
+    pub(crate) gapless: bool,
+    pub(crate) crossfade: bool,
+    pub(crate) bit_perfect_available: bool,
+    pub(crate) bit_perfect_unavailable_reason: Option<&'static str>,
 }
 
 #[tauri::command]
@@ -52,7 +53,7 @@ fn get_native_playback_status(
     native_playback_status(&playback)
 }
 
-fn native_playback_status(
+pub(crate) fn native_playback_status(
     playback: &native_playback::NativePlaybackManager,
 ) -> NativePlaybackStatus {
     let capabilities = playback.capabilities();
@@ -93,6 +94,10 @@ async fn install_native_playback_runtime(
 fn get_native_audio_status(
     audio: State<'_, native_audio::NativeAudioManager>,
 ) -> NativeAudioStatus {
+    native_audio_status(&audio)
+}
+
+pub(crate) fn native_audio_status(audio: &native_audio::NativeAudioManager) -> NativeAudioStatus {
     let capabilities = audio.capabilities();
     NativeAudioStatus {
         backend: capabilities.backend,
@@ -140,14 +145,16 @@ async fn connect_to_server(
 }
 
 #[tauri::command]
-fn forget_server(
-    app: AppHandle,
-    invoking_window: WebviewWindow,
-    state: State<'_, AppState>,
-    playback: State<'_, native_playback::NativePlaybackManager>,
-    audio: State<'_, native_audio::NativeAudioManager>,
-    system_media: State<'_, system_media::SystemMediaManager>,
-) -> Result<(), String> {
+fn forget_server(app: AppHandle, invoking_window: WebviewWindow) -> Result<(), String> {
+    forget_server_inner(&app)?;
+    close_settings_window(&invoking_window)
+}
+
+pub(crate) fn forget_server_inner(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let playback = app.state::<native_playback::NativePlaybackManager>();
+    let audio = app.state::<native_audio::NativeAudioManager>();
+    let system_media = app.state::<system_media::SystemMediaManager>();
     playback
         .dispose_active(native_playback::TerminationReason::ServerSwitched)
         .map_err(|error| error.message)?;
@@ -155,23 +162,24 @@ fn forget_server(
         .dispose_active(native_playback::TerminationReason::ServerSwitched)
         .map_err(|error| error.message)?;
     system_media.clear_all();
-    navigation::main_window(&app)?
+    navigation::main_window(app)?
         .clear_all_browsing_data()
         .map_err(|error| format!("could not clear the Heya WebView session: {error}"))?;
     state.forget()?;
-    navigation::navigate_main_to_picker(&app)?;
-    close_settings_window(&invoking_window)
+    navigation::navigate_main_to_picker(app)
 }
 
 #[tauri::command]
-fn reset_server_session(
-    app: AppHandle,
-    invoking_window: WebviewWindow,
-    state: State<'_, AppState>,
-    playback: State<'_, native_playback::NativePlaybackManager>,
-    audio: State<'_, native_audio::NativeAudioManager>,
-    system_media: State<'_, system_media::SystemMediaManager>,
-) -> Result<(), String> {
+fn reset_server_session(app: AppHandle, invoking_window: WebviewWindow) -> Result<(), String> {
+    reset_server_session_inner(&app)?;
+    close_settings_window(&invoking_window)
+}
+
+pub(crate) fn reset_server_session_inner(app: &AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let playback = app.state::<native_playback::NativePlaybackManager>();
+    let audio = app.state::<native_audio::NativeAudioManager>();
+    let system_media = app.state::<system_media::SystemMediaManager>();
     playback
         .dispose_active(native_playback::TerminationReason::LoggedOut)
         .map_err(|error| error.message)?;
@@ -182,11 +190,10 @@ fn reset_server_session(
     let profile = state
         .profile()
         .ok_or_else(|| "Choose a Heya server before resetting its session.".to_string())?;
-    navigation::main_window(&app)?
+    navigation::main_window(app)?
         .clear_all_browsing_data()
         .map_err(|error| format!("could not clear the Heya WebView session: {error}"))?;
-    navigation::navigate_main_to_server(&app, &profile)?;
-    close_settings_window(&invoking_window)
+    navigation::navigate_main_to_server(app, &profile)
 }
 
 fn close_settings_window(window: &WebviewWindow) -> Result<(), String> {
@@ -227,9 +234,6 @@ pub fn run() {
             connect_to_server,
             forget_server,
             reset_server_session,
-            app_updates::get_update_status,
-            app_updates::check_for_update,
-            app_updates::install_update,
         ]);
 
     #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
@@ -240,11 +244,12 @@ pub fn run() {
 
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let builder = builder.on_menu_event(|app, event| {
-        if matches!(
-            event.id().as_ref(),
-            navigation::SETTINGS_MENU_ID | navigation::SWITCH_SERVER_MENU_ID
-        ) {
+        if event.id().as_ref() == navigation::SETTINGS_MENU_ID {
             navigation::request_settings(app);
+        } else if event.id().as_ref() == navigation::SWITCH_SERVER_MENU_ID {
+            if let Err(error) = navigation::navigate_main_to_picker(app) {
+                log::error!("could not open the Heya server picker: {error}");
+            }
         } else if let Some(command) = system_media::menu_command(event.id().as_ref()) {
             app.state::<system_media::SystemMediaManager>()
                 .dispatch_menu_command(command);
@@ -338,9 +343,6 @@ pub fn run() {
 
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             navigation::install_server_menu(app)?;
-
-            #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
-            app_updates::check_on_startup(app.handle().clone());
 
             Ok(())
         })

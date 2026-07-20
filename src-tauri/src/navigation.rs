@@ -1,7 +1,6 @@
 use crate::server_profile::{same_origin, AppState, ServerProfile};
 use tauri::{
-    webview::NewWindowResponse, App, AppHandle, Manager, Url, WebviewUrl, WebviewWindow,
-    WebviewWindowBuilder,
+    webview::NewWindowResponse, App, AppHandle, Manager, Url, WebviewWindow, WebviewWindowBuilder,
 };
 use tauri_plugin_opener::OpenerExt;
 
@@ -10,6 +9,8 @@ pub const SETTINGS_MENU_ID: &str = "settings";
 pub const SETTINGS_WINDOW_LABEL: &str = "settings";
 pub const MAIN_WINDOW_LABEL: &str = "main";
 const CLIENT_MODE_QUERY_KEY: &str = "heya_client";
+const OPEN_APPLICATION_SETTINGS_SCRIPT: &str =
+    "window.dispatchEvent(new CustomEvent('heya:application:open-settings-v1'))";
 
 pub fn create_main_window(
     app: &mut App,
@@ -46,7 +47,12 @@ pub fn create_main_window(
         .use_https_scheme(cfg!(target_os = "windows"))
         .on_navigation(move |url| {
             if is_switch_server_action(url) {
-                request_settings(&navigation_app);
+                let picker_app = navigation_app.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = navigate_main_to_picker(&picker_app) {
+                        log::error!("could not open the Heya server picker: {error}");
+                    }
+                });
                 return false;
             }
 
@@ -124,12 +130,14 @@ fn native_initialization_script() -> String {
     let playback = crate::native_playback::initialization_script();
     let audio = crate::native_audio::audio_initialization_script();
     let system_media = crate::system_media::system_media_initialization_script();
+    let application = crate::application::initialization_script();
     let window = crate::native_window::initialization_script();
     format!(
-        "{};\n{};\n{};\n{}",
+        "{};\n{};\n{};\n{};\n{}",
         playback.trim_end(),
         audio.trim(),
         system_media.trim(),
+        application.trim(),
         window.trim_start()
     )
 }
@@ -170,67 +178,20 @@ pub fn navigate_main_to_picker(app: &AppHandle) -> Result<(), String> {
 }
 
 pub fn request_settings(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window(SETTINGS_WINDOW_LABEL) {
-        if let Err(error) = window.show().and_then(|_| window.set_focus()) {
-            log::error!("could not focus Heya client settings: {error}");
+    if app.state::<AppState>().profile().is_none() {
+        if let Err(error) = navigate_main_to_picker(app) {
+            log::error!("could not open the Heya server picker: {error}");
         }
         return;
     }
-
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = create_settings_window(&app) {
-            log::error!("could not open Heya client settings: {error}");
-        }
+    let result = main_window(app).and_then(|window| {
+        window
+            .eval(OPEN_APPLICATION_SETTINGS_SCRIPT)
+            .map_err(|error| format!("could not request Heya application settings: {error}"))
     });
-}
-
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-fn create_settings_window(app: &AppHandle) -> Result<WebviewWindow, String> {
-    let settings_url = bootstrap_url(app.config().build.dev_url.as_ref(), "settings=1");
-    let navigation_app = app.clone();
-    let bootstrap_dev_url = app.config().build.dev_url.clone();
-    let new_window_app = app.clone();
-
-    WebviewWindowBuilder::new(
-        app,
-        SETTINGS_WINDOW_LABEL,
-        WebviewUrl::External(settings_url),
-    )
-    .title("Heya Settings")
-    .inner_size(620.0, 720.0)
-    .min_inner_size(480.0, 560.0)
-    .resizable(true)
-    .maximizable(false)
-    .fullscreen(false)
-    .center()
-    .prevent_overflow()
-    .on_navigation(move |url| {
-        if is_bootstrap_url(url, bootstrap_dev_url.as_ref()) {
-            true
-        } else {
-            open_external(&navigation_app, url);
-            false
-        }
-    })
-    .on_new_window(move |url, _features| {
-        open_external(&new_window_app, &url);
-        NewWindowResponse::Deny
-    })
-    .build()
-    .map_err(|error| format!("could not create the local settings window: {error}"))
-}
-
-#[cfg(any(target_os = "android", target_os = "ios"))]
-fn create_settings_window(app: &AppHandle) -> Result<WebviewWindow, String> {
-    let window = main_window(app)?;
-    window
-        .navigate(bootstrap_url(
-            app.config().build.dev_url.as_ref(),
-            "settings=1",
-        ))
-        .map_err(|error| format!("could not open the local settings page: {error}"))?;
-    Ok(window)
+    if let Err(error) = result {
+        log::error!("could not open application settings: {error}");
+    }
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -366,9 +327,11 @@ mod tests {
         assert!(script.contains("__HEYA_NATIVE_PLAYBACK__"));
         assert!(script.contains("__HEYA_NATIVE_AUDIO__"));
         assert!(script.contains("__HEYA_SYSTEM_MEDIA__"));
+        assert!(script.contains("__HEYA_APPLICATION__"));
         assert!(script.contains("plugin:native-bridge|native_audio_request"));
         assert!(script.contains("plugin:native-bridge|native_playback_request"));
         assert!(script.contains("plugin:native-bridge|system_media_request"));
+        assert!(script.contains("plugin:native-bridge|application_request"));
         assert!(!script.contains("heya-native-audio://"));
         assert!(!script.contains("heya-native-playback://"));
     }

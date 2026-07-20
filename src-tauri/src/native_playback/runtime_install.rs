@@ -6,7 +6,10 @@
 //! DLL into app data, then gives the runtime shim its absolute path.
 
 use serde::Serialize;
+use std::sync::Arc;
 use tauri::{ipc::Channel, AppHandle};
+
+type MpvInstallReporter = Arc<dyn Fn(MpvInstallProgress) + Send + Sync>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,7 +46,7 @@ pub enum MpvInstallProgress {
     allow(dead_code)
 )]
 mod windows {
-    use super::{MpvInstallProgress, MpvInstallationOffer};
+    use super::{MpvInstallProgress, MpvInstallReporter, MpvInstallationOffer};
     use chrono::Utc;
     use reqwest::{
         blocking::Client,
@@ -58,7 +61,7 @@ mod windows {
         path::{Path, PathBuf},
         sync::atomic::{AtomicBool, Ordering},
     };
-    use tauri::{ipc::Channel, AppHandle, Manager};
+    use tauri::{AppHandle, Manager};
     use uuid::Uuid;
 
     #[cfg(target_os = "windows")]
@@ -160,31 +163,23 @@ mod windows {
         configure_loader_path(&library)
     }
 
-    pub(super) async fn install(
-        app: AppHandle,
-        on_event: Channel<MpvInstallProgress>,
-    ) -> Result<(), String> {
+    pub(super) async fn install(app: AppHandle, report: MpvInstallReporter) -> Result<(), String> {
         let _guard = InstallGuard::acquire()?;
-        tauri::async_runtime::spawn_blocking(move || install_blocking(&app, &on_event))
+        tauri::async_runtime::spawn_blocking(move || install_blocking(&app, &report))
             .await
             .map_err(|error| format!("the MPV installer task failed: {error}"))?
     }
 
-    fn install_blocking(
-        app: &AppHandle,
-        on_event: &Channel<MpvInstallProgress>,
-    ) -> Result<(), String> {
+    fn install_blocking(app: &AppHandle, report: &MpvInstallReporter) -> Result<(), String> {
         let (provider, asset, architecture) = selected_provider()?;
         let final_runtime = runtime_directory(app, architecture)?;
         let final_library = final_runtime.join(&asset.library);
 
-        on_event
-            .send(MpvInstallProgress::Started {
-                provider: provider.provider.clone(),
-                release: provider.release.clone(),
-                total_bytes: asset.download_bytes,
-            })
-            .map_err(|error| format!("could not report MPV installation progress: {error}"))?;
+        report(MpvInstallProgress::Started {
+            provider: provider.provider.clone(),
+            release: provider.release.clone(),
+            total_bytes: asset.download_bytes,
+        });
 
         let root = runtime_root(app)?;
         fs::create_dir_all(&root)
@@ -195,14 +190,10 @@ mod windows {
         let cleanup = StagingCleanup(staging.clone());
         let archive_path = staging.join("provider.7z");
 
-        download_provider(&provider, &asset, &archive_path, on_event)?;
-        on_event
-            .send(MpvInstallProgress::Verifying)
-            .map_err(|error| format!("could not report MPV verification progress: {error}"))?;
+        download_provider(&provider, &asset, &archive_path, report)?;
+        report(MpvInstallProgress::Verifying);
         verify_sha256(&archive_path, &asset.sha256)?;
-        on_event
-            .send(MpvInstallProgress::Extracting)
-            .map_err(|error| format!("could not report MPV extraction progress: {error}"))?;
+        report(MpvInstallProgress::Extracting);
 
         let staged_runtime = staging.join("runtime");
         fs::create_dir(&staged_runtime)
@@ -234,12 +225,11 @@ mod windows {
         configure_loader_path(&final_library)?;
         drop(cleanup);
 
-        on_event
-            .send(MpvInstallProgress::Installed {
-                provider: provider.provider,
-                release: provider.release,
-            })
-            .map_err(|error| format!("could not report MPV installation completion: {error}"))
+        report(MpvInstallProgress::Installed {
+            provider: provider.provider,
+            release: provider.release,
+        });
+        Ok(())
     }
 
     struct StagingCleanup(PathBuf);
@@ -331,7 +321,7 @@ mod windows {
         provider: &WindowsProvider,
         asset: &ProviderAsset,
         destination: &Path,
-        on_event: &Channel<MpvInstallProgress>,
+        report: &MpvInstallReporter,
     ) -> Result<(), String> {
         let client = Client::builder()
             .redirect(Policy::custom(redirect_policy))
@@ -368,7 +358,7 @@ mod windows {
             output
                 .write_all(&buffer[..read])
                 .map_err(|error| format!("could not save the MPV download: {error}"))?;
-            let _ = on_event.send(MpvInstallProgress::Downloading {
+            report(MpvInstallProgress::Downloading {
                 downloaded_bytes: downloaded,
                 total_bytes: asset.download_bytes,
             });
@@ -579,12 +569,27 @@ pub async fn install_mpv_runtime(
     app: AppHandle,
     on_event: Channel<MpvInstallProgress>,
 ) -> Result<(), String> {
+    let report: MpvInstallReporter = Arc::new(move |event| {
+        let _ = on_event.send(event);
+    });
     #[cfg(all(feature = "native-mpv", target_os = "windows"))]
-    return windows::install(app, on_event).await;
+    return windows::install(app, report).await;
 
     #[cfg(not(all(feature = "native-mpv", target_os = "windows")))]
     {
-        let _ = (app, on_event);
+        let _ = (app, report);
+        Err("MPV installation is not supported on this platform".into())
+    }
+}
+
+pub async fn install_mpv_runtime_silent(app: AppHandle) -> Result<(), String> {
+    let report: MpvInstallReporter = Arc::new(|_| {});
+    #[cfg(all(feature = "native-mpv", target_os = "windows"))]
+    return windows::install(app, report).await;
+
+    #[cfg(not(all(feature = "native-mpv", target_os = "windows")))]
+    {
+        let _ = (app, report);
         Err("MPV installation is not supported on this platform".into())
     }
 }

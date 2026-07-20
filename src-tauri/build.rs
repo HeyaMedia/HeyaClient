@@ -34,6 +34,7 @@ fn main() {
             "native_playback_request",
             "system_media_request",
             "native_window_request",
+            "application_request",
         ]),
     );
     tauri_build::try_build(attributes).expect("failed to build HeyaClient's Tauri context")
