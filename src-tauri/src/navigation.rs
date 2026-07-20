@@ -114,11 +114,19 @@ pub fn create_main_window(
     let window = builder.build()?;
 
     #[cfg(target_os = "macos")]
-    if let Err(error) = crate::native_window::configure_native_main_window(&window) {
-        log::warn!(
-            "could not configure native macOS window chrome: {}",
-            error.message
-        );
+    {
+        if let Err(error) = crate::native_window::configure_native_main_window(&window) {
+            log::warn!(
+                "could not configure native macOS window chrome: {}",
+                error.message
+            );
+        }
+        if let Err(error) = crate::native_window::enable_history_swipe_gestures(&window) {
+            log::warn!(
+                "could not enable macOS swipe navigation gestures: {}",
+                error.message
+            );
+        }
     }
 
     Ok(window)

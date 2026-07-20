@@ -241,6 +241,26 @@ fn install_native_navbar_drag_monitor(ns_window: Retained<NSWindow>) -> Result<(
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn enable_history_swipe_gestures<R: Runtime>(
+    window: &WebviewWindow<R>,
+) -> Result<(), BridgeError> {
+    // WKWebView ships with two-finger swipe history navigation disabled and
+    // Tauri exposes no builder toggle for it, so the property is set on the
+    // native view directly. with_webview runs the closure on the main thread.
+    window
+        .with_webview(|webview| unsafe {
+            let wk_webview = webview.inner().cast::<objc2::runtime::AnyObject>();
+            if let Some(wk_webview) = wk_webview.as_ref() {
+                let _: () = objc2::msg_send![
+                    wk_webview,
+                    setAllowsBackForwardNavigationGestures: true
+                ];
+            }
+        })
+        .map_err(window_error)
+}
+
+#[cfg(target_os = "macos")]
 pub(crate) fn set_native_controls_visible<R: Runtime>(
     window: &WebviewWindow<R>,
     visible: bool,
