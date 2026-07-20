@@ -17,9 +17,9 @@ pub mod visualizer;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 use tracing::{debug, info, warn};
 
 use self::callback::{AudioCallbackState, SharedAtomics};
@@ -39,13 +39,25 @@ const BACKGROUND_DECODE_BATCH_SECONDS: usize = 1;
 const VISUALIZER_BUFFER_POOL_SIZE: usize = 8;
 const VISUALIZER_BUFFER_CAPACITY_SAMPLES: usize = 64 * 1024;
 const RETIRED_PCM_BUFFER_CAPACITY: usize = 8;
+/// How long playback must sit paused/stopped before the OS output stream is
+/// suspended. Long enough that pause→resume within a beat never touches the
+/// stream, short enough that an idle window stops burning coreaudiod CPU.
+const STREAM_IDLE_PAUSE_AFTER: Duration = Duration::from_secs(2);
+const CONTROL_IDLE_POLL: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy, Debug)]
+enum StreamCtl {
+    Pause,
+    Resume,
+    Shutdown,
+}
 
 pub struct AudioEngine {
     cmd_tx: Sender<Command>,
     atomics: Arc<SharedAtomics>,
     event_rx: Receiver<EngineEvent>,
     running: Arc<AtomicBool>,
-    stream_stop_tx: Sender<()>,
+    stream_ctl_tx: Sender<StreamCtl>,
     device_sample_rate: u32,
     device_channels: u16,
     output_device_id: String,
@@ -56,7 +68,7 @@ impl Drop for AudioEngine {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
         let _ = self.cmd_tx.try_send(Command::Shutdown);
-        let _ = self.stream_stop_tx.try_send(());
+        let _ = self.stream_ctl_tx.try_send(StreamCtl::Shutdown);
     }
 }
 
@@ -138,12 +150,39 @@ impl AudioEngine {
             "native audio engine started"
         );
 
-        let (stream_stop_tx, stream_stop_rx) = bounded::<()>(1);
+        // The Stream is !Send-safe by convention (see CpalOutput) — it lives on
+        // this holder thread, which also owns pausing/resuming it on behalf of
+        // the control thread.
+        let (stream_ctl_tx, stream_ctl_rx) = bounded::<StreamCtl>(8);
         std::thread::Builder::new()
             .name("heya-audio-output".into())
             .spawn(move || {
-                let _output = output;
-                let _ = stream_stop_rx.recv();
+                let output = output;
+                let mut stream_paused = false;
+                loop {
+                    match stream_ctl_rx.recv() {
+                        Ok(StreamCtl::Pause) if !stream_paused => match output.pause() {
+                            Ok(()) => {
+                                stream_paused = true;
+                                debug!("audio output stream suspended (idle)");
+                            }
+                            Err(error) => {
+                                warn!(%error, "could not suspend idle audio output stream");
+                            }
+                        },
+                        Ok(StreamCtl::Resume) if stream_paused => match output.resume() {
+                            Ok(()) => {
+                                stream_paused = false;
+                                debug!("audio output stream resumed");
+                            }
+                            Err(error) => {
+                                warn!(%error, "could not resume audio output stream");
+                            }
+                        },
+                        Ok(StreamCtl::Pause) | Ok(StreamCtl::Resume) => {}
+                        Ok(StreamCtl::Shutdown) | Err(_) => break,
+                    }
+                }
             })
             .map_err(|error| format!("failed to start audio output holder: {error}"))?;
 
@@ -154,14 +193,22 @@ impl AudioEngine {
         std::thread::Builder::new()
             .name("heya-audio-position".into())
             .spawn(move || {
+                let mut last_published_frames = u64::MAX;
                 while running_position.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(250));
-                    if atomics_for_position_thread.get_state() == EngineState::Stopped {
+                    let state = atomics_for_position_thread.get_state();
+                    if state == EngineState::Stopped {
                         continue;
                     }
                     let frames = atomics_for_position_thread
                         .position_frames
                         .load(Ordering::Relaxed);
+                    // Paused position can only move via a seek; republishing the
+                    // same frame 4×/sec just wakes the event relay and webview.
+                    if state == EngineState::Paused && frames == last_published_frames {
+                        continue;
+                    }
+                    last_published_frames = frames;
                     let duration_ms = atomics_for_position_thread
                         .duration_ms
                         .load(Ordering::Relaxed);
@@ -207,6 +254,7 @@ impl AudioEngine {
             .map_err(|error| format!("failed to start visualizer: {error}"))?;
 
         let running_control = running.clone();
+        let stream_ctl_for_control = stream_ctl_tx.clone();
         std::thread::Builder::new()
             .name("heya-audio-control".into())
             .spawn(move || {
@@ -219,6 +267,7 @@ impl AudioEngine {
                     atomics,
                     device_sample_rate,
                     device_channels,
+                    stream_ctl_for_control,
                 );
                 running_control.store(false, Ordering::Release);
             })
@@ -229,7 +278,7 @@ impl AudioEngine {
             atomics: atomics_position,
             event_rx,
             running,
-            stream_stop_tx,
+            stream_ctl_tx,
             device_sample_rate,
             device_channels,
             output_device_id,
@@ -273,6 +322,7 @@ fn control_thread_main(
     atomics: Arc<SharedAtomics>,
     device_sample_rate: u32,
     device_channels: u16,
+    stream_ctl_tx: Sender<StreamCtl>,
 ) {
     let mut crossfade_settings = CrossfadeSettings::default();
     let mut normalization_enabled = true;
@@ -301,54 +351,92 @@ fn control_thread_main(
         atomics.active_deck_id.store(id, Ordering::Relaxed);
     }
 
+    let mut stream_paused = false;
+    let mut idle_since: Option<Instant> = None;
     loop {
-        match cmd_rx.recv() {
-            Ok(cmd) => match cmd {
-                Command::Play { source, meta } => {
-                    let active_rk = atomics.active_rating_key.load(Ordering::Relaxed);
-                    let active_id = atomics.active_deck_id.load(Ordering::Relaxed);
-                    let pending = pending_deck(&atomics);
-                    info!(
-                        rating_key = meta.rating_key,
-                        active_rk,
-                        pending_rk = pending_rating_key,
-                        active_deck = active_id,
-                        ?pending,
-                        "PLAY command received"
-                    );
-
-                    // Check if this track is already playing (scheduler beat us to it)
-                    let already_active = active_rk == meta.rating_key;
-                    // Check if the preload was truncated (stream error during download)
-                    let preload_broken =
-                        atomics.preload_error_rk.load(Ordering::Relaxed) == meta.rating_key;
-                    if already_active {
+        match cmd_rx.recv_timeout(CONTROL_IDLE_POLL) {
+            Ok(cmd) => {
+                // The callback only drains commands while the stream ticks — wake
+                // the stream before forwarding anything, or the command would sit
+                // unprocessed until the next resume.
+                if stream_paused {
+                    let _ = stream_ctl_tx.send(StreamCtl::Resume);
+                    stream_paused = false;
+                }
+                idle_since = None;
+                match cmd {
+                    Command::Play { source, meta } => {
+                        let active_rk = atomics.active_rating_key.load(Ordering::Relaxed);
+                        let active_id = atomics.active_deck_id.load(Ordering::Relaxed);
+                        let pending = pending_deck(&atomics);
                         info!(
                             rating_key = meta.rating_key,
-                            "track already active, skipping play"
+                            active_rk,
+                            pending_rk = pending_rating_key,
+                            active_deck = active_id,
+                            ?pending,
+                            "PLAY command received"
                         );
-                        pending_rating_key = 0;
-                    // If the pending deck already has this track preloaded, just transition
-                    } else if pending_rating_key == meta.rating_key
-                        && pending_rating_key != 0
-                        && !preload_broken
-                    {
-                        info!(rating_key = meta.rating_key, "using preloaded deck");
-                        cache_ramps(&meta, &audio_cmd_tx);
-                        let _ =
-                            audio_cmd_tx.send(AudioCommand::TransitionToActive { user_skip: true });
-                        set_active_eagerly(&atomics, pending);
-                        pending_rating_key = 0;
-                    } else {
-                        if preload_broken {
-                            warn!(
+
+                        // Check if this track is already playing (scheduler beat us to it)
+                        let already_active = active_rk == meta.rating_key;
+                        // Check if the preload was truncated (stream error during download)
+                        let preload_broken =
+                            atomics.preload_error_rk.load(Ordering::Relaxed) == meta.rating_key;
+                        if already_active {
+                            info!(
                                 rating_key = meta.rating_key,
-                                "preload was truncated, re-fetching"
+                                "track already active, skipping play"
                             );
-                            atomics.preload_error_rk.store(0, Ordering::Relaxed);
+                            pending_rating_key = 0;
+                        // If the pending deck already has this track preloaded, just transition
+                        } else if pending_rating_key == meta.rating_key
+                            && pending_rating_key != 0
+                            && !preload_broken
+                        {
+                            info!(rating_key = meta.rating_key, "using preloaded deck");
+                            cache_ramps(&meta, &audio_cmd_tx);
+                            let _ = audio_cmd_tx
+                                .send(AudioCommand::TransitionToActive { user_skip: true });
+                            set_active_eagerly(&atomics, pending);
+                            pending_rating_key = 0;
+                        } else {
+                            if preload_broken {
+                                warn!(
+                                    rating_key = meta.rating_key,
+                                    "preload was truncated, re-fetching"
+                                );
+                                atomics.preload_error_rk.store(0, Ordering::Relaxed);
+                            }
+                            let deck = pending;
+                            handle_play(
+                                &source,
+                                &meta,
+                                deck,
+                                &audio_cmd_tx,
+                                deck_tx(deck, &deck_a_tx, &deck_b_tx),
+                                &event_tx,
+                                &atomics,
+                                &crossfade_settings,
+                                normalization_enabled,
+                                device_sample_rate,
+                                device_channels,
+                            );
+                            // Eagerly reflect the upcoming deck swap
+                            set_active_eagerly(&atomics, deck);
+                            pending_rating_key = 0;
                         }
-                        let deck = pending;
-                        handle_play(
+                    }
+                    Command::PreloadNext { source, meta } => {
+                        let deck = pending_deck(&atomics);
+                        info!(
+                            rating_key = meta.rating_key,
+                            ?deck,
+                            active_deck = atomics.active_deck_id.load(Ordering::Relaxed),
+                            "PRELOAD command"
+                        );
+                        pending_rating_key = meta.rating_key;
+                        handle_preload(
                             &source,
                             &meta,
                             deck,
@@ -361,136 +449,128 @@ fn control_thread_main(
                             device_sample_rate,
                             device_channels,
                         );
-                        // Eagerly reflect the upcoming deck swap
-                        set_active_eagerly(&atomics, deck);
-                        pending_rating_key = 0;
                     }
-                }
-                Command::PreloadNext { source, meta } => {
-                    let deck = pending_deck(&atomics);
-                    info!(
-                        rating_key = meta.rating_key,
-                        ?deck,
-                        active_deck = atomics.active_deck_id.load(Ordering::Relaxed),
-                        "PRELOAD command"
-                    );
-                    pending_rating_key = meta.rating_key;
-                    handle_preload(
-                        &source,
-                        &meta,
-                        deck,
-                        &audio_cmd_tx,
-                        deck_tx(deck, &deck_a_tx, &deck_b_tx),
-                        &event_tx,
-                        &atomics,
-                        &crossfade_settings,
-                        normalization_enabled,
-                        device_sample_rate,
-                        device_channels,
-                    );
-                }
-                Command::Pause => {
-                    let _ = audio_cmd_tx.send(AudioCommand::Pause);
-                }
-                Command::Resume => {
-                    let _ = audio_cmd_tx.send(AudioCommand::Resume);
-                }
-                Command::Stop => {
-                    let _ = audio_cmd_tx.send(AudioCommand::Stop);
-                }
-                Command::Seek { position_ms } => {
-                    handle_seek(position_ms, &audio_cmd_tx);
-                }
-                Command::SetVolume { gain } => {
-                    let _ = audio_cmd_tx.send(AudioCommand::SetVolume(gain));
-                }
-                Command::SetNormalization { enabled } => {
-                    normalization_enabled = enabled;
-                    let _ = audio_cmd_tx.send(AudioCommand::SetNormalization(enabled));
-                }
-                Command::UpdateTrackAnalysis {
-                    rating_key,
-                    gain_db,
-                    intro_end_ms,
-                    outro_start_ms,
-                    fade_start_ms,
-                    silence_start_ms,
-                } => {
-                    let _ = audio_cmd_tx.send(AudioCommand::UpdateTrackAnalysis {
+                    Command::Pause => {
+                        let _ = audio_cmd_tx.send(AudioCommand::Pause);
+                    }
+                    Command::Resume => {
+                        let _ = audio_cmd_tx.send(AudioCommand::Resume);
+                    }
+                    Command::Stop => {
+                        let _ = audio_cmd_tx.send(AudioCommand::Stop);
+                    }
+                    Command::Seek { position_ms } => {
+                        handle_seek(position_ms, &audio_cmd_tx);
+                    }
+                    Command::SetVolume { gain } => {
+                        let _ = audio_cmd_tx.send(AudioCommand::SetVolume(gain));
+                    }
+                    Command::SetNormalization { enabled } => {
+                        normalization_enabled = enabled;
+                        let _ = audio_cmd_tx.send(AudioCommand::SetNormalization(enabled));
+                    }
+                    Command::UpdateTrackAnalysis {
                         rating_key,
                         gain_db,
                         intro_end_ms,
                         outro_start_ms,
                         fade_start_ms,
                         silence_start_ms,
-                    });
+                    } => {
+                        let _ = audio_cmd_tx.send(AudioCommand::UpdateTrackAnalysis {
+                            rating_key,
+                            gain_db,
+                            intro_end_ms,
+                            outro_start_ms,
+                            fade_start_ms,
+                            silence_start_ms,
+                        });
+                    }
+                    Command::SetPreampGain { db } => {
+                        let _ = audio_cmd_tx.send(AudioCommand::SetPreampGain(db));
+                    }
+                    Command::SetEq { gains_db } => {
+                        let _ = audio_cmd_tx.send(AudioCommand::SetEq(gains_db));
+                    }
+                    Command::SetEqEnabled { enabled } => {
+                        let _ = audio_cmd_tx.send(AudioCommand::SetEqEnabled(enabled));
+                    }
+                    Command::SetEqPostgain { db } => {
+                        let _ = audio_cmd_tx.send(AudioCommand::SetEqPostgain(db));
+                    }
+                    Command::SetLimiterEnabled { enabled } => {
+                        let _ = audio_cmd_tx.send(AudioCommand::SetLimiterEnabled(enabled));
+                    }
+                    Command::SetCrossfeed { enabled, preset } => {
+                        let _ = audio_cmd_tx.send(AudioCommand::SetCrossfeed { enabled, preset });
+                    }
+                    Command::SetCrossfeedBeforeEq { before } => {
+                        let _ = audio_cmd_tx.send(AudioCommand::SetCrossfeedBeforeEq(before));
+                    }
+                    Command::SetCrossfadeWindow { ms } => {
+                        crossfade_settings.crossfade_window_ms = ms;
+                        let _ = audio_cmd_tx.send(AudioCommand::UpdateCrossfadeSettings(
+                            crossfade_settings.clone(),
+                        ));
+                    }
+                    Command::SetSameAlbumCrossfade { enabled } => {
+                        crossfade_settings.same_album_crossfade = enabled;
+                        let _ = audio_cmd_tx.send(AudioCommand::UpdateCrossfadeSettings(
+                            crossfade_settings.clone(),
+                        ));
+                    }
+                    Command::SetSmartCrossfade { enabled } => {
+                        crossfade_settings.smart_crossfade = enabled;
+                        let _ = audio_cmd_tx.send(AudioCommand::UpdateCrossfadeSettings(
+                            crossfade_settings.clone(),
+                        ));
+                    }
+                    Command::SetSmartCrossfadeMax { ms } => {
+                        crossfade_settings.smart_crossfade_max_ms = ms;
+                        let _ = audio_cmd_tx.send(AudioCommand::UpdateCrossfadeSettings(
+                            crossfade_settings.clone(),
+                        ));
+                    }
+                    Command::SetMixrampDb { db } => {
+                        crossfade_settings.mixramp_db = db;
+                        let _ = audio_cmd_tx.send(AudioCommand::UpdateCrossfadeSettings(
+                            crossfade_settings.clone(),
+                        ));
+                    }
+                    Command::SetVisualizerEnabled { enabled } => {
+                        let _ = audio_cmd_tx.send(AudioCommand::SetVisualizerEnabled(enabled));
+                    }
+                    Command::SetCacheMaxBytes { .. } | Command::ClearCache => {
+                        // HeyaClient deliberately does not persist credentialed media bytes.
+                    }
+                    Command::DuckAndApply { duck_ms } => {
+                        let _ = audio_cmd_tx.send(AudioCommand::DuckAndApply { duck_ms });
+                    }
+                    Command::Shutdown => {
+                        info!("audio engine control thread shutting down");
+                        break;
+                    }
                 }
-                Command::SetPreampGain { db } => {
-                    let _ = audio_cmd_tx.send(AudioCommand::SetPreampGain(db));
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // Nothing in flight. Once playback has sat paused/stopped for
+                // a grace period, suspend the OS output stream so the render
+                // callback (and coreaudiod) stop burning CPU on silence.
+                let idle = matches!(
+                    atomics.get_state(),
+                    EngineState::Paused | EngineState::Stopped
+                );
+                if !idle {
+                    idle_since = None;
+                } else if !stream_paused {
+                    let since = *idle_since.get_or_insert_with(Instant::now);
+                    if since.elapsed() >= STREAM_IDLE_PAUSE_AFTER {
+                        let _ = stream_ctl_tx.send(StreamCtl::Pause);
+                        stream_paused = true;
+                    }
                 }
-                Command::SetEq { gains_db } => {
-                    let _ = audio_cmd_tx.send(AudioCommand::SetEq(gains_db));
-                }
-                Command::SetEqEnabled { enabled } => {
-                    let _ = audio_cmd_tx.send(AudioCommand::SetEqEnabled(enabled));
-                }
-                Command::SetEqPostgain { db } => {
-                    let _ = audio_cmd_tx.send(AudioCommand::SetEqPostgain(db));
-                }
-                Command::SetLimiterEnabled { enabled } => {
-                    let _ = audio_cmd_tx.send(AudioCommand::SetLimiterEnabled(enabled));
-                }
-                Command::SetCrossfeed { enabled, preset } => {
-                    let _ = audio_cmd_tx.send(AudioCommand::SetCrossfeed { enabled, preset });
-                }
-                Command::SetCrossfeedBeforeEq { before } => {
-                    let _ = audio_cmd_tx.send(AudioCommand::SetCrossfeedBeforeEq(before));
-                }
-                Command::SetCrossfadeWindow { ms } => {
-                    crossfade_settings.crossfade_window_ms = ms;
-                    let _ = audio_cmd_tx.send(AudioCommand::UpdateCrossfadeSettings(
-                        crossfade_settings.clone(),
-                    ));
-                }
-                Command::SetSameAlbumCrossfade { enabled } => {
-                    crossfade_settings.same_album_crossfade = enabled;
-                    let _ = audio_cmd_tx.send(AudioCommand::UpdateCrossfadeSettings(
-                        crossfade_settings.clone(),
-                    ));
-                }
-                Command::SetSmartCrossfade { enabled } => {
-                    crossfade_settings.smart_crossfade = enabled;
-                    let _ = audio_cmd_tx.send(AudioCommand::UpdateCrossfadeSettings(
-                        crossfade_settings.clone(),
-                    ));
-                }
-                Command::SetSmartCrossfadeMax { ms } => {
-                    crossfade_settings.smart_crossfade_max_ms = ms;
-                    let _ = audio_cmd_tx.send(AudioCommand::UpdateCrossfadeSettings(
-                        crossfade_settings.clone(),
-                    ));
-                }
-                Command::SetMixrampDb { db } => {
-                    crossfade_settings.mixramp_db = db;
-                    let _ = audio_cmd_tx.send(AudioCommand::UpdateCrossfadeSettings(
-                        crossfade_settings.clone(),
-                    ));
-                }
-                Command::SetVisualizerEnabled { enabled } => {
-                    let _ = audio_cmd_tx.send(AudioCommand::SetVisualizerEnabled(enabled));
-                }
-                Command::SetCacheMaxBytes { .. } | Command::ClearCache => {
-                    // HeyaClient deliberately does not persist credentialed media bytes.
-                }
-                Command::DuckAndApply { duck_ms } => {
-                    let _ = audio_cmd_tx.send(AudioCommand::DuckAndApply { duck_ms });
-                }
-                Command::Shutdown => {
-                    info!("audio engine control thread shutting down");
-                    break;
-                }
-            },
-            Err(_) => {
+            }
+            Err(RecvTimeoutError::Disconnected) => {
                 info!("command channel disconnected, control thread exiting");
                 break;
             }

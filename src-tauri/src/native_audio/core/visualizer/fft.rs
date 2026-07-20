@@ -1,7 +1,9 @@
 //! FFT processing — Hann window + realfft → frequency bins in dB.
 
-use realfft::RealFftPlanner;
+use realfft::num_complex::Complex;
+use realfft::{RealFftPlanner, RealToComplex};
 use std::f32::consts::PI;
+use std::sync::Arc;
 
 /// FFT size (matching the JS engine's AnalyserNode fftSize).
 pub const FFT_SIZE: usize = 2048;
@@ -16,44 +18,81 @@ fn hann_window(size: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Compute FFT frequency bins from time-domain samples.
+/// Reusable FFT state — plan, window, and scratch buffers.
 ///
-/// Input: `FFT_SIZE` mono samples (if stereo, caller should downmix first).
-/// Output: `NUM_BINS` values in dB (relative to full scale).
-pub fn compute_fft(samples: &[f32]) -> Vec<f32> {
-    if samples.len() < FFT_SIZE {
-        return vec![-100.0; NUM_BINS];
+/// Planning a rustfft FFT is orders of magnitude more expensive than running
+/// one; this runs per visualizer frame, so the plan must be built once and
+/// kept, not recreated per call.
+pub struct FftAnalyzer {
+    fft: Arc<dyn RealToComplex<f32>>,
+    window: Vec<f32>,
+    windowed: Vec<f32>,
+    spectrum: Vec<Complex<f32>>,
+    scratch: Vec<Complex<f32>>,
+}
+
+impl FftAnalyzer {
+    pub fn new() -> Self {
+        let fft = RealFftPlanner::<f32>::new().plan_fft_forward(FFT_SIZE);
+        let spectrum = fft.make_output_vec();
+        let scratch = fft.make_scratch_vec();
+        Self {
+            fft,
+            window: hann_window(FFT_SIZE),
+            windowed: vec![0.0; FFT_SIZE],
+            spectrum,
+            scratch,
+        }
     }
 
-    let window = hann_window(FFT_SIZE);
+    /// Compute FFT frequency bins from time-domain samples.
+    ///
+    /// Input: `FFT_SIZE` mono samples (if stereo, caller should downmix first).
+    /// Output: `NUM_BINS` values in dB (relative to full scale).
+    pub fn compute(&mut self, samples: &[f32]) -> Vec<f32> {
+        if samples.len() < FFT_SIZE {
+            return vec![-100.0; NUM_BINS];
+        }
 
-    // Apply window
-    let mut windowed: Vec<f32> = samples[..FFT_SIZE]
-        .iter()
-        .zip(window.iter())
-        .map(|(s, w)| s * w)
-        .collect();
+        for ((out, sample), coeff) in self
+            .windowed
+            .iter_mut()
+            .zip(&samples[..FFT_SIZE])
+            .zip(&self.window)
+        {
+            *out = sample * coeff;
+        }
 
-    // Compute FFT
-    let mut planner = RealFftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(FFT_SIZE);
-    let mut spectrum = fft.make_output_vec();
+        self.fft
+            .process_with_scratch(&mut self.windowed, &mut self.spectrum, &mut self.scratch)
+            .ok();
 
-    fft.process(&mut windowed, &mut spectrum).ok();
+        // Convert to dB magnitude
+        let scale = 2.0 / FFT_SIZE as f32;
+        self.spectrum
+            .iter()
+            .map(|c| {
+                let magnitude = c.norm() * scale;
+                if magnitude > 1e-10 {
+                    20.0 * magnitude.log10()
+                } else {
+                    -100.0
+                }
+            })
+            .collect()
+    }
+}
 
-    // Convert to dB magnitude
-    let scale = 2.0 / FFT_SIZE as f32;
-    spectrum
-        .iter()
-        .map(|c| {
-            let magnitude = c.norm() * scale;
-            if magnitude > 1e-10 {
-                20.0 * magnitude.log10()
-            } else {
-                -100.0
-            }
-        })
-        .collect()
+impl Default for FftAnalyzer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One-shot FFT for tests and callers without a long-lived analyzer.
+#[cfg(test)]
+pub fn compute_fft(samples: &[f32]) -> Vec<f32> {
+    FftAnalyzer::new().compute(samples)
 }
 
 /// Downmix interleaved stereo to mono by averaging channels.

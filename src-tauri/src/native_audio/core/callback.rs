@@ -228,9 +228,13 @@ impl AudioCallbackState {
                 .saturating_sub(output_frames as u64);
         }
 
-        // 6. Process DSP chain (direct access, no lock)
-        self.dsp_chain
-            .process(data, self.device_sample_rate, self.device_channels);
+        // 6. Process DSP chain (direct access, no lock). Skipped while idle:
+        //    the buffer is already zeroed and running EQ/limiter over silence
+        //    keeps the limiter's log10 path hot for nothing.
+        if rendered_audio {
+            self.dsp_chain
+                .process(data, self.device_sample_rate, self.device_channels);
+        }
 
         // 7. Update position atomics
         self.update_position_atomics();
@@ -244,8 +248,11 @@ impl AudioCallbackState {
         // 10. Handle duck-and-apply countdown
         self.tick_duck(output_frames as u32);
 
-        // 11. Send visualizer data (~60fps)
-        self.maybe_send_vis_frame(data);
+        // 11. Send visualizer data (~60fps) — silence carries nothing worth
+        //     an FFT + webview event
+        if rendered_audio {
+            self.maybe_send_vis_frame(data);
+        }
     }
 
     // -----------------------------------------------------------------------

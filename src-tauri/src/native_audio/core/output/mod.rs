@@ -256,6 +256,27 @@ impl CpalOutput {
             device_name,
         })
     }
+
+    /// Stop the OS render callback without tearing the stream down. The
+    /// device stays claimed (exclusive mode keeps its hog), so `resume`
+    /// is glitch-free and cheap.
+    pub fn pause(&self) -> Result<(), String> {
+        match &self.stream {
+            Some(stream) => stream
+                .pause()
+                .map_err(|error| format!("stream pause: {error}")),
+            None => Ok(()),
+        }
+    }
+
+    pub fn resume(&self) -> Result<(), String> {
+        match &self.stream {
+            Some(stream) => stream
+                .play()
+                .map_err(|error| format!("stream play: {error}")),
+            None => Ok(()),
+        }
+    }
 }
 
 pub fn enumerate_output_devices(
