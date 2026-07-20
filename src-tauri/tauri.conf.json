@@ -1,7 +1,7 @@
 {
   "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
   "productName": "Heya",
-  "version": "0.2.13",
+  "version": "0.2.14",
   "identifier": "media.heya.client",
   "build": {
     "beforeDevCommand": "bun run bootstrap:build",
