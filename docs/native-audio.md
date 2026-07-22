@@ -74,7 +74,7 @@ sample. Decoder channels are bounded and the callback consumes at most one
 batch per deck per device deadline, so a fast decoder cannot make one callback
 copy an entire track. Track-sized PCM capacity is allocated on the control
 thread and retired on a reclaimer thread. Visualizer callback buffers are drawn
-from a preallocated pool rather than allocating at 60 Hz.
+from a preallocated pool rather than allocating for every 30 Hz frame.
 
 If network delivery still runs dry, HeyaClient emits a distinct underrun log,
 enters buffering, and waits for two seconds of decoded headroom (or confirmed
@@ -83,8 +83,6 @@ on a marginal connection.
 
 ## Output policy
 
-Protocol v2 deliberately has one reliable shared-output pipeline. The former
-experimental bit-perfect/exclusive branch was removed: it rebuilt the renderer,
-changed system device state, disabled normal controls and DSP, and did not have
-enough platform coverage to justify a second lifecycle. Source and output
-formats remain visible in diagnostics, and resampling is reported explicitly.
+Protocol v2 deliberately has one reliable shared-output pipeline. Source and
+output formats remain visible in diagnostics, and resampling is reported
+explicitly without changing system device state or disabling normal controls.

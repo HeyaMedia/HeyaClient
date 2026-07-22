@@ -15,10 +15,9 @@ Windows processed audio supports:
 - Gapless playback, queue resume, seek, waveform, and FFT visualizers.
 - Real-time/high-priority audio callback scheduling through CPAL.
 
-Bit-perfect playback is not advertised on Windows yet. CPAL's current WASAPI
-output is shared-mode and may invoke the Windows mixer/converter. A future
-WASAPI exclusive adapter must prove exact device format negotiation before the
-setting is enabled.
+Audio uses WASAPI shared mode, matching HeyaClient's single reliable output
+policy on every platform. Source and output formats remain visible in
+diagnostics, including whether sample-rate conversion is active.
 
 ## Tester checklist
 

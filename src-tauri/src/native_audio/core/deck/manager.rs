@@ -140,7 +140,7 @@ impl DeckState {
     /// Uses the metadata duration (from the play command) rather than the
     /// current buffer size, because during streaming/incremental decode the
     /// buffer is still growing. The metadata duration is the authoritative
-    /// track length used for scheduler transition points and position events.
+    /// track length used for scheduler transition points and clock snapshots.
     pub fn duration_secs(&self) -> f32 {
         // Prefer metadata duration — it's known from the start
         if let Some(ref meta) = self.meta {

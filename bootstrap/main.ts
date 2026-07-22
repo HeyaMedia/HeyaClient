@@ -13,7 +13,6 @@ interface AppSettings {
   reconnect_on_launch: boolean;
   native_playback_enabled: boolean;
   native_audio_enabled: boolean;
-  bit_perfect_audio_enabled: boolean;
   audio_output_device_id: string | null;
   track_change_notifications: boolean;
 }
@@ -53,8 +52,6 @@ interface NativeAudioStatus {
   available: boolean;
   gapless: boolean;
   crossfade: boolean;
-  bit_perfect_available: boolean;
-  bit_perfect_unavailable_reason: string | null;
 }
 
 interface UpdateStatus {
@@ -95,9 +92,6 @@ const nativePlaybackEnabled = requiredElement<HTMLInputElement>(
 );
 const nativeAudioEnabled = requiredElement<HTMLInputElement>(
   "native-audio-enabled",
-);
-const bitPerfectAudioEnabled = requiredElement<HTMLInputElement>(
-  "bit-perfect-audio-enabled",
 );
 const trackChangeNotifications = requiredElement<HTMLInputElement>(
   "track-change-notifications",
@@ -166,7 +160,6 @@ let appSettings: AppSettings = {
   reconnect_on_launch: true,
   native_playback_enabled: true,
   native_audio_enabled: true,
-  bit_perfect_audio_enabled: false,
   audio_output_device_id: null,
   track_change_notifications: false,
 };
@@ -242,10 +235,6 @@ nativeAudioEnabled.addEventListener("change", () => {
   void savePreferences();
 });
 
-bitPerfectAudioEnabled.addEventListener("change", () => {
-  void savePreferences();
-});
-
 trackChangeNotifications.addEventListener("change", () => {
   void savePreferences();
 });
@@ -290,7 +279,6 @@ async function initialize(): Promise<void> {
   reconnectOnLaunch.checked = appSettings.reconnect_on_launch;
   nativePlaybackEnabled.checked = appSettings.native_playback_enabled;
   nativeAudioEnabled.checked = appSettings.native_audio_enabled;
-  bitPerfectAudioEnabled.checked = appSettings.bit_perfect_audio_enabled;
   trackChangeNotifications.checked = appSettings.track_change_notifications;
   updateSavedActionAvailability();
   void refreshNativePlaybackStatus();
@@ -435,7 +423,6 @@ async function savePreferences(showConfirmation = true): Promise<boolean> {
     reconnect_on_launch: reconnectOnLaunch.checked,
     native_playback_enabled: nativePlaybackEnabled.checked,
     native_audio_enabled: nativeAudioEnabled.checked,
-    bit_perfect_audio_enabled: bitPerfectAudioEnabled.checked,
     audio_output_device_id: appSettings.audio_output_device_id,
     track_change_notifications: trackChangeNotifications.checked,
   };
@@ -468,7 +455,6 @@ async function savePreferences(showConfirmation = true): Promise<boolean> {
     reconnectOnLaunch.checked = previousSettings.reconnect_on_launch;
     nativePlaybackEnabled.checked = previousSettings.native_playback_enabled;
     nativeAudioEnabled.checked = previousSettings.native_audio_enabled;
-    bitPerfectAudioEnabled.checked = previousSettings.bit_perfect_audio_enabled;
     trackChangeNotifications.checked = previousSettings.track_change_notifications;
     setStatus("error", "Couldn’t save the preference", errorMessage(error));
     return false;
@@ -483,7 +469,6 @@ function setPreferencesSaving(value: boolean): void {
   reconnectOnLaunch.disabled = disabled;
   nativePlaybackEnabled.disabled = disabled;
   nativeAudioEnabled.disabled = disabled;
-  bitPerfectAudioEnabled.disabled = disabled || bitPerfectAudioEnabled.dataset.available !== "true";
   trackChangeNotifications.disabled = disabled;
 }
 
@@ -617,16 +602,9 @@ async function refreshNativeAudioStatus(): Promise<void> {
   try {
     const audio = await invoke<NativeAudioStatus>("get_native_audio_status");
     nativeAudioStatus.dataset.available = String(audio.available);
-    bitPerfectAudioEnabled.dataset.available = String(audio.bit_perfect_available);
-    bitPerfectAudioEnabled.disabled = busy || savingPreferences || !audio.bit_perfect_available;
-    if (!audio.bit_perfect_available && appSettings.bit_perfect_audio_enabled) {
-      bitPerfectAudioEnabled.checked = false;
-    }
     if (audio.available) {
       nativeAudioStatusTitle.textContent = "Native music is available";
-      nativeAudioStatusDetail.textContent = audio.bit_perfect_available
-        ? "Gapless, crossfade, DSP, and exclusive bit-perfect output are available."
-        : `Gapless, crossfade, and DSP are ready. ${audio.bit_perfect_unavailable_reason ?? "Bit-perfect output is unavailable."}`;
+      nativeAudioStatusDetail.textContent = "Gapless, crossfade, DSP, and output-device selection are ready.";
     } else {
       nativeAudioStatusTitle.textContent = "Native music is unavailable";
       nativeAudioStatusDetail.textContent = "Browser music playback remains available.";
@@ -635,8 +613,6 @@ async function refreshNativeAudioStatus(): Promise<void> {
     nativeAudioStatus.dataset.available = "false";
     nativeAudioStatusTitle.textContent = "Couldn’t check native audio";
     nativeAudioStatusDetail.textContent = errorMessage(error);
-    bitPerfectAudioEnabled.dataset.available = "false";
-    bitPerfectAudioEnabled.disabled = true;
   } finally {
     refreshNativeAudioButton.disabled = busy;
   }
