@@ -87,7 +87,7 @@ pub fn mix_decks(
 
 /// Read a single sample from a deck for the given output channel.
 fn read_sample(deck: &DeckState, output_ch: usize, output_channels: usize) -> f32 {
-    if !deck.loaded || deck.position >= deck.samples.len() {
+    if !deck.loaded || deck.samples.is_empty() {
         return 0.0;
     }
 
@@ -101,35 +101,34 @@ fn read_sample(deck: &DeckState, output_ch: usize, output_channels: usize) -> f3
     // a surround/HDMI mix format for stereo music, leave the non-front channels
     // silent rather than copying the left channel into center, LFE and surrounds.
     if deck_ch == 1 {
-        return deck.samples.get(deck.position).copied().unwrap_or(0.0);
+        return deck.samples.get(0).unwrap_or(0.0);
     }
     if output_channels == 1 {
-        let frame = &deck.samples[deck.position..(deck.position + deck_ch).min(deck.samples.len())];
-        return frame.iter().sum::<f32>() / frame.len().max(1) as f32;
+        let available_channels = deck_ch.min(deck.samples.len());
+        let sum = (0..available_channels)
+            .filter_map(|channel| deck.samples.get(channel))
+            .sum::<f32>();
+        return sum / available_channels.max(1) as f32;
     }
     if output_ch >= deck_ch {
         return 0.0;
     }
     let src_ch = output_ch;
 
-    let sample_idx = deck.position + src_ch;
-    if sample_idx < deck.samples.len() {
-        deck.samples[sample_idx]
-    } else {
-        0.0
-    }
+    deck.samples.get(src_ch).unwrap_or(0.0)
 }
 
 /// Advance deck position by one frame (all channels).
 fn advance_position(deck: &mut DeckState) {
-    if !deck.loaded || deck.position >= deck.samples.len() {
+    if !deck.loaded || deck.samples.is_empty() {
         return;
     }
     let deck_ch = deck.channels as usize;
     if deck_ch == 0 {
         return;
     }
-    deck.position += deck_ch;
+    let consumed = deck.samples.consume(deck_ch);
+    deck.sample_offset = deck.sample_offset.saturating_add(consumed);
 }
 
 #[cfg(test)]
@@ -140,8 +139,7 @@ mod tests {
 
     fn make_deck(_id: DeckId, samples: Vec<f32>, channels: u16) -> DeckState {
         DeckState {
-            samples,
-            position: 0,
+            samples: super::super::super::deck::manager::PcmRing::from_samples(samples),
             meta: None,
             sample_rate: 44100,
             channels,

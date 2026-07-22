@@ -2,7 +2,7 @@
 //!
 //! The audio callback sends raw PCM chunks via a lock-free channel.
 //! The visualizer task accumulates them into a rolling buffer, computes
-//! FFT at ~30fps, and emits VisFrame events to JS.
+//! FFT at ~30fps, and emits lossy visualizer frames on a dedicated channel.
 
 pub mod fft;
 

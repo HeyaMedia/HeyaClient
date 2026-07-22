@@ -2,6 +2,12 @@
 
 use serde::Serialize;
 
+#[derive(Debug, Clone)]
+pub struct VisualizerFrame {
+    pub samples: Vec<f32>,
+    pub frequency_bins: Vec<f32>,
+}
+
 /// Events the engine emits to the frontend.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -25,6 +31,13 @@ pub enum EngineEvent {
         output_sample_rate: u32,
         output_channels: u16,
     },
+    PreloadLoading {
+        rating_key: i64,
+    },
+    PreloadReady {
+        rating_key: i64,
+        buffered_ms: u64,
+    },
     Error {
         message: String,
     },
@@ -33,11 +46,5 @@ pub enum EngineEvent {
     PreloadError {
         rating_key: i64,
         message: String,
-    },
-    VisFrame {
-        /// Compact mono time-domain samples for scope/VU rendering.
-        samples: Vec<f32>,
-        /// FFT frequency bins in dB.
-        frequency_bins: Vec<f32>,
     },
 }

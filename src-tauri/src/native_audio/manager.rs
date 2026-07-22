@@ -2,15 +2,16 @@ use super::core::dsp::crossfeed::CrossfeedPreset as EngineCrossfeedPreset;
 use super::{
     core::{
         command::Command as EngineCommand,
-        event::EngineEvent,
+        event::{EngineEvent, VisualizerFrame},
         output::{enumerate_output_devices, validate_output_device},
         types::EngineState,
         AudioEngine, AudioEngineClock,
     },
     AudioCapabilities, AudioCommand, AudioCommandRequest, AudioCommandResult, AudioLoadResult,
     AudioProcessingSettings, CrossfadeMode, CrossfeedPreset, DspBlockId, NativeAudioOutputDevice,
-    NativeAudioOutputDevices, NativeAudioState, NativeAudioStateEvent, NativeAudioVisualizerEvent,
-    ValidatedAudioLoad, ValidatedAudioTrack, NATIVE_AUDIO_PROTOCOL_VERSION,
+    NativeAudioOutputDevices, NativeAudioPreloadStatus, NativeAudioState, NativeAudioStateEvent,
+    NativeAudioVisualizerEvent, ValidatedAudioLoad, ValidatedAudioTrack,
+    NATIVE_AUDIO_PROTOCOL_VERSION,
 };
 use crate::native_playback::{
     BridgeError, BridgeErrorCode, CommandId, PlaybackError, RendererSessionId, TerminationReason,
@@ -184,6 +185,7 @@ impl NativeAudioManager {
         let engine = AudioEngine::start(preferred_device_id)
             .map_err(|message| BridgeError::new(BridgeErrorCode::BackendUnavailable, message))?;
         let events = engine.events();
+        let visualizer_events = engine.visualizer_events();
         let renderer_session_id = RendererSessionId::generate();
         log::info!(
             "native audio load accepted renderer={} track={} start_seconds={:.3}",
@@ -199,6 +201,7 @@ impl NativeAudioManager {
             duration_seconds: load.track.meta.duration_ms as f64 / 1000.0,
             output_sample_rate_hz: Some(engine.device_sample_rate()),
             output_channels: Some(engine.device_channels()),
+            output_sample_format: Some(engine.output_sample_format().to_string()),
             output_device_id: Some(engine.output_device_id().to_string()),
             output_device_name: Some(engine.output_device_name().to_string()),
             dsp_active: processing_is_active(&load.processing),
@@ -240,6 +243,11 @@ impl NativeAudioManager {
 
         publish_state(&self.shared, &renderer_session_id);
         spawn_event_relay(self.shared.clone(), renderer_session_id.clone(), events)?;
+        spawn_visualizer_relay(
+            self.shared.clone(),
+            renderer_session_id.clone(),
+            visualizer_events,
+        )?;
 
         Ok(AudioLoadResult {
             renderer_session_id,
@@ -540,43 +548,77 @@ fn spawn_event_relay(
         })
 }
 
+fn spawn_visualizer_relay(
+    shared: Arc<Shared>,
+    renderer_session_id: RendererSessionId,
+    events: Receiver<VisualizerFrame>,
+) -> Result<(), BridgeError> {
+    thread::Builder::new()
+        .name(format!(
+            "heya-audio-visualizer-events-{}",
+            &renderer_session_id.as_str()[..8]
+        ))
+        .spawn(move || loop {
+            match events.recv_timeout(EVENT_POLL_INTERVAL) {
+                Ok(frame) => handle_visualizer_frame(&shared, &renderer_session_id, frame),
+                Err(RecvTimeoutError::Timeout) => {
+                    let current = shared.state.lock().ok().and_then(|manager| {
+                        manager
+                            .active
+                            .as_ref()
+                            .map(|active| active.snapshot.renderer_session_id.clone())
+                    });
+                    if current.as_ref() != Some(&renderer_session_id) {
+                        return;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        })
+        .map(|_| ())
+        .map_err(|error| {
+            BridgeError::new(
+                BridgeErrorCode::BackendUnavailable,
+                format!("could not start the native audio visualizer worker: {error}"),
+            )
+        })
+}
+
+fn handle_visualizer_frame(
+    shared: &Shared,
+    renderer_session_id: &RendererSessionId,
+    frame: VisualizerFrame,
+) {
+    let output = {
+        let Ok(mut manager) = shared.state.lock() else {
+            return;
+        };
+        let Some(active) = manager.active.as_mut() else {
+            return;
+        };
+        if &active.snapshot.renderer_session_id != renderer_session_id {
+            return;
+        }
+        active.snapshot.visualizer_revision = active.snapshot.visualizer_revision.saturating_add(1);
+        (
+            active.snapshot.owner.clone(),
+            NativeAudioVisualizerEvent {
+                protocol_version: NATIVE_AUDIO_PROTOCOL_VERSION,
+                renderer_session_id: renderer_session_id.clone(),
+                visualizer_revision: active.snapshot.visualizer_revision,
+                samples: frame.samples,
+                frequency_bins: frame.frequency_bins,
+            },
+        )
+    };
+    shared.sink.visualizer(&output.0, &output.1);
+}
+
 fn handle_engine_event(
     shared: &Shared,
     renderer_session_id: &RendererSessionId,
     event: EngineEvent,
 ) {
-    if let EngineEvent::VisFrame {
-        samples,
-        frequency_bins,
-    } = event
-    {
-        let output = {
-            let Ok(mut manager) = shared.state.lock() else {
-                return;
-            };
-            let Some(active) = manager.active.as_mut() else {
-                return;
-            };
-            if &active.snapshot.renderer_session_id != renderer_session_id {
-                return;
-            }
-            active.snapshot.visualizer_revision =
-                active.snapshot.visualizer_revision.saturating_add(1);
-            (
-                active.snapshot.owner.clone(),
-                NativeAudioVisualizerEvent {
-                    protocol_version: NATIVE_AUDIO_PROTOCOL_VERSION,
-                    renderer_session_id: renderer_session_id.clone(),
-                    visualizer_revision: active.snapshot.visualizer_revision,
-                    samples,
-                    frequency_bins,
-                },
-            )
-        };
-        shared.sink.visualizer(&output.0, &output.1);
-        return;
-    }
-
     {
         let Ok(mut manager) = shared.state.lock() else {
             return;
@@ -616,7 +658,12 @@ fn handle_engine_event(
                     "stopped" => {
                         active.state.playing = false;
                         active.state.paused = true;
+                        active.state.loading = false;
                         active.state.buffering = false;
+                        active.state.preload_track_id = None;
+                        active.state.preload_status = NativeAudioPreloadStatus::Idle;
+                        active.state.preload_buffered_seconds = 0.0;
+                        active.state.preload_error = None;
                     }
                     _ => {}
                 }
@@ -653,7 +700,14 @@ fn handle_engine_event(
                     active.state.position_seconds = 0.0;
                 }
                 active.state.ended = false;
+                active.state.error = None;
                 active.state.termination_reason = None;
+                if active.state.preload_track_id == Some(rating_key) {
+                    active.state.preload_track_id = None;
+                    active.state.preload_status = NativeAudioPreloadStatus::Idle;
+                    active.state.preload_buffered_seconds = 0.0;
+                    active.state.preload_error = None;
+                }
                 if let Some(format) = active.track_formats.get(&rating_key).copied() {
                     apply_track_format(active, format);
                 }
@@ -691,6 +745,21 @@ fn handle_engine_event(
                     apply_track_format(active, format);
                 }
             }
+            EngineEvent::PreloadLoading { rating_key } => {
+                active.state.preload_track_id = Some(rating_key);
+                active.state.preload_status = NativeAudioPreloadStatus::Loading;
+                active.state.preload_buffered_seconds = 0.0;
+                active.state.preload_error = None;
+            }
+            EngineEvent::PreloadReady {
+                rating_key,
+                buffered_ms,
+            } => {
+                active.state.preload_track_id = Some(rating_key);
+                active.state.preload_status = NativeAudioPreloadStatus::Ready;
+                active.state.preload_buffered_seconds = buffered_ms as f64 / 1000.0;
+                active.state.preload_error = None;
+            }
             EngineEvent::Error { message } => {
                 active.state.loading = false;
                 active.state.buffering = false;
@@ -710,8 +779,11 @@ fn handle_engine_event(
                     "native audio preload failed renderer={} track={rating_key}: {message}",
                     renderer_session_id.as_str(),
                 );
+                active.state.preload_track_id = Some(rating_key);
+                active.state.preload_status = NativeAudioPreloadStatus::Failed;
+                active.state.preload_buffered_seconds = 0.0;
+                active.state.preload_error = Some(message);
             }
-            EngineEvent::VisFrame { .. } => unreachable!(),
         }
     }
     publish_state(shared, renderer_session_id);

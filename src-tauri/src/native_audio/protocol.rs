@@ -273,6 +273,16 @@ pub struct AudioLoadResult {
     pub renderer_session_id: RendererSessionId,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum NativeAudioPreloadStatus {
+    #[default]
+    Idle,
+    Loading,
+    Ready,
+    Failed,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeAudioState {
@@ -292,10 +302,16 @@ pub struct NativeAudioState {
     pub source_channels: Option<u16>,
     pub output_sample_rate_hz: Option<u32>,
     pub output_channels: Option<u16>,
+    pub output_sample_format: Option<String>,
     pub output_device_id: Option<String>,
     pub output_device_name: Option<String>,
     pub resampler_active: bool,
     pub dsp_active: bool,
+    pub preload_track_id: Option<i64>,
+    pub preload_status: NativeAudioPreloadStatus,
+    pub preload_buffered_seconds: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preload_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<PlaybackError>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -321,10 +337,15 @@ impl Default for NativeAudioState {
             source_channels: None,
             output_sample_rate_hz: None,
             output_channels: None,
+            output_sample_format: None,
             output_device_id: None,
             output_device_name: None,
             resampler_active: false,
             dsp_active: false,
+            preload_track_id: None,
+            preload_status: NativeAudioPreloadStatus::Idle,
+            preload_buffered_seconds: 0.0,
+            preload_error: None,
             error: None,
             termination_reason: None,
         }
@@ -366,6 +387,7 @@ pub struct AudioCommandResult {
 mod tests {
     use super::{
         AudioCommand, AudioCommandRequest, NativeAudioOutputDevice, NativeAudioOutputDevices,
+        NativeAudioPreloadStatus, NativeAudioState,
     };
     use serde_json::json;
 
@@ -464,5 +486,24 @@ mod tests {
                 "followsSystemDefault": false
             })
         );
+    }
+
+    #[test]
+    fn serializes_output_format_and_preload_lifecycle_for_javascript() {
+        let value = serde_json::to_value(NativeAudioState {
+            output_sample_rate_hz: Some(96_000),
+            output_sample_format: Some("f32".into()),
+            preload_track_id: Some(42),
+            preload_status: NativeAudioPreloadStatus::Ready,
+            preload_buffered_seconds: 3.0,
+            ..NativeAudioState::default()
+        })
+        .expect("serialize native audio state");
+
+        assert_eq!(value["outputSampleRateHz"], 96_000);
+        assert_eq!(value["outputSampleFormat"], "f32");
+        assert_eq!(value["preloadTrackId"], 42);
+        assert_eq!(value["preloadStatus"], "ready");
+        assert_eq!(value["preloadBufferedSeconds"], 3.0);
     }
 }

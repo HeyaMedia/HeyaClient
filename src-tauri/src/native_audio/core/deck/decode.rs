@@ -320,8 +320,8 @@ mod tests {
     #[test]
     fn stream_is_seekable_when_length_is_known_before_probe() {
         let wav = generate_test_wav(44_100, 2, 2.0);
-        let buffer = SharedBuffer::new(None);
-        buffer.push(&wav);
+        let buffer = SharedBuffer::new(None).unwrap();
+        buffer.push(&wav).unwrap();
         buffer.set_content_length(wav.len() as u64);
         buffer.finish();
 
@@ -354,14 +354,14 @@ mod tests {
         let wav = generate_test_wav(44100, 2, 0.5);
         let total_len = wav.len();
 
-        let shared = SharedBuffer::new(Some(total_len as u64));
+        let shared = SharedBuffer::new(Some(total_len as u64)).unwrap();
 
         // Simulate chunked delivery
         let shared_w = shared.clone();
         let writer = std::thread::spawn(move || {
             for chunk in wav.chunks(4096) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                shared_w.push(chunk);
+                shared_w.push(chunk).unwrap();
             }
             shared_w.finish();
         });

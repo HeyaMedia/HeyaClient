@@ -276,13 +276,16 @@ pub fn run() {
 
     builder
         .setup(|app| {
-            if cfg!(debug_assertions) {
-                app.handle().plugin(
-                    tauri_plugin_log::Builder::default()
-                        .level(log::LevelFilter::Info)
-                        .build(),
-                )?;
-            }
+            // Keep bounded lifecycle diagnostics in production as well as
+            // development. Intermittent device/decoder failures cannot be
+            // reconstructed from the WebView after the fact.
+            app.handle().plugin(
+                tauri_plugin_log::Builder::default()
+                    .level(log::LevelFilter::Info)
+                    .max_file_size(2_000_000)
+                    .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3))
+                    .build(),
+            )?;
 
             let config_dir = app.path().app_config_dir()?;
             let state = AppState::new(config_dir)

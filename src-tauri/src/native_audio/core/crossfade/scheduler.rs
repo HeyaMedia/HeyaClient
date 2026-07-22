@@ -38,6 +38,10 @@ impl Scheduler {
         self.mode = mode;
     }
 
+    pub fn mode(&self) -> SchedulerMode {
+        self.mode
+    }
+
     /// Set the absolute trigger time (seconds into the outgoing track).
     pub fn set_transition_point(&mut self, time_sec: f32) {
         self.transition_time_sec = time_sec;

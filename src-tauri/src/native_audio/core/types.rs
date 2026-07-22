@@ -32,6 +32,15 @@ impl EngineState {
             _ => Self::Stopped,
         }
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Buffering => "buffering",
+            Self::Playing => "playing",
+            Self::Paused => "paused",
+        }
+    }
 }
 
 /// Identifies which physical deck (A or B).

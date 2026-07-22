@@ -19,6 +19,7 @@ pub struct CpalOutput {
     stream: Option<Stream>,
     pub sample_rate: u32,
     pub channels: u16,
+    pub sample_format: String,
     pub device_id: String,
     pub device_name: String,
 }
@@ -139,6 +140,7 @@ impl CpalOutput {
             stream: Some(stream),
             sample_rate,
             channels,
+            sample_format: sample_format.to_string(),
             device_id,
             device_name,
         })

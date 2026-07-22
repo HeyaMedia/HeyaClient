@@ -308,10 +308,16 @@ fn open_external(app: &AppHandle, url: &Url) {
     if matches!(url.scheme(), "http" | "https" | "mailto" | "tel") {
         log::info!("opening external URL at {}", origin_for_log(url));
         if let Err(error) = app.opener().open_url(url.as_str(), None::<&str>) {
-            log::warn!("could not open external URL {url}: {error}");
+            log::warn!(
+                "could not open external URL at {}: {error}",
+                origin_for_log(url)
+            );
         }
     } else {
-        log::warn!("blocked top-level navigation to unsupported URL scheme: {url}");
+        log::warn!(
+            "blocked top-level navigation with unsupported scheme: {}",
+            url.scheme()
+        );
     }
 }
 

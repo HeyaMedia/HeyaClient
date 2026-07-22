@@ -1,141 +1,182 @@
-//! Stateful streaming audio resampler.
+//! High-quality stateful streaming audio resampler.
 //!
-//! Decoder output arrives in independent batches. Resampling each batch from
-//! scratch loses the fractional source position at every boundary and repeats
-//! the final source frame, which can produce an audible tick for common
-//! conversions such as 44.1 kHz to 48 kHz. This resampler keeps the previous
-//! frame and an exact rational output position for the lifetime of a track.
+//! The output rate is the current rate reported by the selected OS audio
+//! device. A fixed-ratio FFT resampler provides anti-alias filtering for common
+//! conversions such as 44.1 kHz to 48/96 kHz while preserving state across
+//! decoder batches.
 
-/// Linear streaming resampler for interleaved PCM.
-///
-/// Linear interpolation is intentionally retained for now, but unlike the old
-/// batch helper this type is continuous across decoder batches and produces an
-/// exact, deterministic number of output frames at end-of-stream.
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Fft, FixedSync, Indexing, Resampler};
+
+const RESAMPLER_CHUNK_FRAMES: usize = 4_096;
+
 pub struct StreamingResampler {
     channels: usize,
     source_rate: u64,
     target_rate: u64,
+    resampler: Fft<f32>,
+    input: Vec<f32>,
+    input_offset: usize,
     input_frames: u64,
     output_frames: u64,
-    previous_frame: Vec<f32>,
+    delay_frames: usize,
     finished: bool,
 }
 
 impl StreamingResampler {
-    pub fn new(channels: u16, source_rate: u32, target_rate: u32) -> Self {
-        Self {
-            channels: usize::from(channels),
+    pub fn new(channels: u16, source_rate: u32, target_rate: u32) -> Result<Self, String> {
+        let channels = usize::from(channels);
+        if channels == 0 || source_rate == 0 || target_rate == 0 {
+            return Err("audio resampler requires non-zero channels and sample rates".into());
+        }
+        let resampler = Fft::<f32>::new(
+            source_rate as usize,
+            target_rate as usize,
+            RESAMPLER_CHUNK_FRAMES,
+            channels,
+            FixedSync::Input,
+        )
+        .map_err(|error| format!("could not create audio resampler: {error}"))?;
+        let delay_frames = resampler.output_delay();
+
+        Ok(Self {
+            channels,
             source_rate: u64::from(source_rate),
             target_rate: u64::from(target_rate),
+            resampler,
+            input: Vec::with_capacity(RESAMPLER_CHUNK_FRAMES * channels * 2),
+            input_offset: 0,
             input_frames: 0,
             output_frames: 0,
-            previous_frame: Vec::new(),
+            delay_frames,
             finished: false,
-        }
+        })
     }
 
-    /// Resample another decoder batch. The final source frame is retained until
-    /// the following batch so interpolation can cross the boundary correctly.
-    pub fn process(&mut self, samples: &[f32]) -> Vec<f32> {
-        self.process_inner(samples, false)
-    }
-
-    /// Flush the final fractional frame after the decoder reaches clean EOF.
-    pub fn finish(&mut self) -> Vec<f32> {
-        self.process_inner(&[], true)
-    }
-
-    fn process_inner(&mut self, samples: &[f32], end_of_stream: bool) -> Vec<f32> {
-        if self.finished || self.channels == 0 || self.source_rate == 0 || self.target_rate == 0 {
-            return Vec::new();
+    pub fn process(&mut self, samples: &[f32]) -> Result<Vec<f32>, String> {
+        if self.finished {
+            return Ok(Vec::new());
         }
+        let complete_samples = samples.len() / self.channels * self.channels;
+        self.input.extend_from_slice(&samples[..complete_samples]);
+        self.input_frames = self
+            .input_frames
+            .saturating_add((complete_samples / self.channels) as u64);
 
-        let batch_frames = samples.len() / self.channels;
-        let batch_start = self.input_frames;
-        self.input_frames = self.input_frames.saturating_add(batch_frames as u64);
-
-        if self.input_frames == 0 {
-            if end_of_stream {
-                self.finished = true;
-            }
-            return Vec::new();
-        }
-
-        let final_output_frames = end_of_stream.then(|| {
-            self.input_frames
-                .saturating_mul(self.target_rate)
-                .saturating_add(self.source_rate - 1)
-                / self.source_rate
-        });
-        let estimated_frames = if let Some(total) = final_output_frames {
-            total.saturating_sub(self.output_frames)
-        } else {
-            (batch_frames as u64)
-                .saturating_mul(self.target_rate)
-                .saturating_add(self.source_rate - 1)
-                / self.source_rate
-        };
-        let mut output = Vec::with_capacity(
-            usize::try_from(estimated_frames)
-                .unwrap_or(0)
-                .saturating_mul(self.channels),
-        );
-
+        let mut output = Vec::new();
         loop {
-            if final_output_frames.is_some_and(|total| self.output_frames >= total) {
+            let needed_frames = self.resampler.input_frames_next();
+            if self.available_input_frames() < needed_frames {
                 break;
             }
-
-            let source_position = self.output_frames.saturating_mul(self.source_rate);
-            let frame_a = source_position / self.target_rate;
-            let remainder = source_position % self.target_rate;
-
-            // Until EOF, retain the newest frame so the next decoder batch can
-            // provide the right-hand interpolation sample.
-            if !end_of_stream && frame_a.saturating_add(1) >= self.input_frames {
-                break;
-            }
-
-            let last_frame = self.input_frames - 1;
-            let frame_b = frame_a.saturating_add(1).min(last_frame);
-            let fraction = remainder as f32 / self.target_rate as f32;
-
-            for channel in 0..self.channels {
-                let a = self.sample_at(samples, batch_start, frame_a.min(last_frame), channel);
-                let b = self.sample_at(samples, batch_start, frame_b, channel);
-                output.push(a + (b - a) * fraction);
-            }
-            self.output_frames = self.output_frames.saturating_add(1);
+            let raw = self.process_chunk(needed_frames, None)?;
+            self.append_output(&mut output, raw, None);
         }
-
-        if batch_frames > 0 {
-            let start = (batch_frames - 1) * self.channels;
-            self.previous_frame.clear();
-            self.previous_frame
-                .extend_from_slice(&samples[start..start + self.channels]);
-        }
-        if end_of_stream {
-            self.finished = true;
-        }
-
-        output
+        self.compact_input();
+        Ok(output)
     }
 
-    fn sample_at(&self, samples: &[f32], batch_start: u64, frame: u64, channel: usize) -> f32 {
-        if frame < batch_start {
-            return self.previous_frame.get(channel).copied().unwrap_or(0.0);
+    pub fn finish(&mut self) -> Result<Vec<f32>, String> {
+        if self.finished {
+            return Ok(Vec::new());
         }
 
-        let local_frame = usize::try_from(frame - batch_start).unwrap_or(usize::MAX);
-        samples
-            .get(
-                local_frame
-                    .saturating_mul(self.channels)
-                    .saturating_add(channel),
-            )
-            .copied()
-            .or_else(|| self.previous_frame.get(channel).copied())
-            .unwrap_or(0.0)
+        let target_frames = self
+            .input_frames
+            .saturating_mul(self.target_rate)
+            .saturating_add(self.source_rate - 1)
+            / self.source_rate;
+        let mut output = Vec::new();
+        let remaining_frames = self.available_input_frames();
+        if remaining_frames > 0 {
+            let raw = self.process_chunk(remaining_frames, Some(remaining_frames))?;
+            self.append_output(&mut output, raw, Some(target_frames));
+        }
+
+        // Flush the FFT overlap with zero-length partial chunks until all
+        // source-duration output frames have been emitted.
+        while self.output_frames < target_frames {
+            let needed_frames = self.resampler.input_frames_next();
+            let silence = vec![0.0; needed_frames * self.channels];
+            let adapter = InterleavedSlice::new(&silence, self.channels, needed_frames)
+                .map_err(|error| format!("could not prepare resampler flush input: {error}"))?;
+            let indexing = Indexing {
+                partial_len: Some(0),
+                ..Indexing::default()
+            };
+            let raw = self
+                .resampler
+                .process(&adapter, Some(&indexing))
+                .map_err(|error| format!("could not flush audio resampler: {error}"))?
+                .take_data();
+            let before = self.output_frames;
+            self.append_output(&mut output, raw, Some(target_frames));
+            if self.output_frames == before {
+                return Err("audio resampler flush made no progress".into());
+            }
+        }
+
+        self.finished = true;
+        self.input.clear();
+        self.input_offset = 0;
+        Ok(output)
+    }
+
+    fn process_chunk(
+        &mut self,
+        consumed_frames: usize,
+        partial_len: Option<usize>,
+    ) -> Result<Vec<f32>, String> {
+        let start = self.input_offset;
+        let end = start.saturating_add(consumed_frames.saturating_mul(self.channels));
+        let input = self
+            .input
+            .get(start..end)
+            .ok_or_else(|| "audio resampler input accounting was inconsistent".to_string())?;
+        let adapter = InterleavedSlice::new(input, self.channels, consumed_frames)
+            .map_err(|error| format!("could not prepare resampler input: {error}"))?;
+        let indexing = partial_len.map(|frames| Indexing {
+            partial_len: Some(frames),
+            ..Indexing::default()
+        });
+        let output = self
+            .resampler
+            .process(&adapter, indexing.as_ref())
+            .map_err(|error| format!("could not resample audio: {error}"))?
+            .take_data();
+        self.input_offset = end;
+        Ok(output)
+    }
+
+    fn append_output(&mut self, target: &mut Vec<f32>, raw: Vec<f32>, cap: Option<u64>) {
+        let raw_frames = raw.len() / self.channels;
+        let skipped_frames = self.delay_frames.min(raw_frames);
+        self.delay_frames -= skipped_frames;
+        let available_frames = raw_frames.saturating_sub(skipped_frames);
+        let accepted_frames = cap.map_or(available_frames, |limit| {
+            available_frames.min(limit.saturating_sub(self.output_frames) as usize)
+        });
+        let start = skipped_frames * self.channels;
+        let end = start + accepted_frames * self.channels;
+        target.extend_from_slice(&raw[start..end]);
+        self.output_frames = self.output_frames.saturating_add(accepted_frames as u64);
+    }
+
+    fn available_input_frames(&self) -> usize {
+        self.input.len().saturating_sub(self.input_offset) / self.channels
+    }
+
+    fn compact_input(&mut self) {
+        if self.input_offset == 0 {
+            return;
+        }
+        if self.input_offset >= self.input.len() {
+            self.input.clear();
+            self.input_offset = 0;
+        } else if self.input_offset >= RESAMPLER_CHUNK_FRAMES * self.channels {
+            self.input.drain(..self.input_offset);
+            self.input_offset = 0;
+        }
     }
 }
 
@@ -153,29 +194,36 @@ mod tests {
         samples
     }
 
-    fn resample_in_chunks(samples: &[f32], chunk_frames: usize) -> Vec<f32> {
-        let mut resampler = StreamingResampler::new(2, 44_100, 48_000);
+    fn resample_in_chunks(samples: &[f32], chunk_frames: usize, target_rate: u32) -> Vec<f32> {
+        let mut resampler = StreamingResampler::new(2, 44_100, target_rate).unwrap();
         let mut output = Vec::new();
         for chunk in samples.chunks(chunk_frames * 2) {
-            output.extend(resampler.process(chunk));
+            output.extend(resampler.process(chunk).unwrap());
         }
-        output.extend(resampler.finish());
+        output.extend(resampler.finish().unwrap());
         output
     }
 
     #[test]
     fn resample_44100_to_48000_has_exact_duration() {
         let samples = stereo_sine(44_100, 44_100.0);
-        let output = resample_in_chunks(&samples, 44_100);
+        let output = resample_in_chunks(&samples, 44_100, 48_000);
         assert_eq!(output.len() / 2, 48_000);
+    }
+
+    #[test]
+    fn resample_44100_to_96000_has_exact_duration() {
+        let samples = stereo_sine(44_100, 44_100.0);
+        let output = resample_in_chunks(&samples, 7_919, 96_000);
+        assert_eq!(output.len() / 2, 96_000);
     }
 
     #[test]
     fn decoder_batch_boundaries_do_not_change_output() {
         let samples = stereo_sine(44_100 * 3, 44_100.0);
-        let whole = resample_in_chunks(&samples, samples.len() / 2);
-        let one_second_batches = resample_in_chunks(&samples, 44_100);
-        let uneven_batches = resample_in_chunks(&samples, 7_919);
+        let whole = resample_in_chunks(&samples, samples.len() / 2, 96_000);
+        let one_second_batches = resample_in_chunks(&samples, 44_100, 96_000);
+        let uneven_batches = resample_in_chunks(&samples, 7_919, 96_000);
 
         assert_eq!(whole, one_second_batches);
         assert_eq!(whole, uneven_batches);
@@ -183,15 +231,13 @@ mod tests {
 
     #[test]
     fn finish_is_idempotent() {
-        let mut resampler = StreamingResampler::new(1, 48_000, 44_100);
+        let mut resampler = StreamingResampler::new(1, 48_000, 44_100).unwrap();
         let input = vec![0.5; 48_000];
-        let mut output = resampler.process(&input);
-        output.extend(resampler.finish());
+        let mut output = resampler.process(&input).unwrap();
+        output.extend(resampler.finish().unwrap());
 
         assert_eq!(output.len(), 44_100);
-        assert!(output
-            .iter()
-            .all(|sample| (*sample - 0.5).abs() < f32::EPSILON));
-        assert!(resampler.finish().is_empty());
+        assert!(output.iter().all(|sample| sample.is_finite()));
+        assert!(resampler.finish().unwrap().is_empty());
     }
 }

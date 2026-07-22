@@ -15,7 +15,7 @@ pub mod types;
 pub mod visualizer;
 
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,7 +26,7 @@ use self::callback::{AudioCallbackState, SharedAtomics};
 use self::command::{AudioCommand, Command, SampleBatch};
 use self::crossfade::types::{parse_ramp, CrossfadeSettings, TrackRamps};
 use self::deck::decode;
-use self::event::EngineEvent;
+use self::event::{EngineEvent, VisualizerFrame};
 use self::output::resample::StreamingResampler;
 use self::output::CpalOutput;
 use self::types::{AudioSource, DeckId, EngineState, TrackMeta};
@@ -36,9 +36,11 @@ pub const PLAYBACK_GRANT_HEADER: &str = "X-Heya-Playback-Grant";
 const SAMPLE_BATCH_CHANNEL_CAPACITY: usize = 8;
 const INITIAL_DECODE_SECONDS: usize = 3;
 const BACKGROUND_DECODE_BATCH_SECONDS: usize = 1;
+const PCM_BUFFER_SECONDS: usize = 24;
+const MAX_COMPRESSED_SPOOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const VISUALIZER_BUFFER_POOL_SIZE: usize = 8;
 const VISUALIZER_BUFFER_CAPACITY_SAMPLES: usize = 64 * 1024;
-const RETIRED_PCM_BUFFER_CAPACITY: usize = 8;
+const RETIRED_PCM_BUFFER_CAPACITY: usize = 32;
 /// How long playback must sit paused/stopped before the OS output stream is
 /// suspended. Long enough that pause→resume within a beat never touches the
 /// stream, short enough that an idle window stops burning coreaudiod CPU.
@@ -52,14 +54,35 @@ enum StreamCtl {
     Shutdown,
 }
 
+fn pending_deck(atomics: &SharedAtomics) -> DeckId {
+    if atomics.active_deck_id.load(Ordering::Relaxed) == 0 {
+        DeckId::B
+    } else {
+        DeckId::A
+    }
+}
+
+fn deck_generation(atomics: &SharedAtomics, deck: DeckId) -> Arc<AtomicU64> {
+    match deck {
+        DeckId::A => atomics.deck_a_generation.clone(),
+        DeckId::B => atomics.deck_b_generation.clone(),
+    }
+}
+
+fn next_deck_generation(atomics: &SharedAtomics, deck: DeckId) -> u64 {
+    deck_generation(atomics, deck).fetch_add(1, Ordering::Relaxed) + 1
+}
+
 pub struct AudioEngine {
     cmd_tx: Sender<Command>,
     atomics: Arc<SharedAtomics>,
     event_rx: Receiver<EngineEvent>,
+    visualizer_event_rx: Receiver<VisualizerFrame>,
     running: Arc<AtomicBool>,
     stream_ctl_tx: Sender<StreamCtl>,
     device_sample_rate: u32,
     device_channels: u16,
+    output_sample_format: String,
     output_device_id: String,
     output_device_name: String,
 }
@@ -70,6 +93,80 @@ pub struct AudioEngineClock {
     pub position_seconds: f64,
     pub duration_seconds: f64,
     pub active_track_id: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LoadIntent {
+    Play,
+    Preload,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_load_job(
+    intent: LoadIntent,
+    source: AudioSource,
+    meta: TrackMeta,
+    deck: DeckId,
+    generation: u64,
+    audio_cmd_tx: Sender<AudioCommand>,
+    sample_tx: Sender<SampleBatch>,
+    event_tx: Sender<EngineEvent>,
+    atomics: Arc<SharedAtomics>,
+    normalization_enabled: bool,
+    device_rate: u32,
+    device_channels: u16,
+) {
+    let rating_key = meta.rating_key;
+    let worker_event_tx = event_tx.clone();
+    let worker_atomics = atomics.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name(format!("heya-audio-load-{rating_key}"))
+        .spawn(move || match intent {
+            LoadIntent::Play => handle_play(
+                &source,
+                &meta,
+                deck,
+                generation,
+                &audio_cmd_tx,
+                &sample_tx,
+                &worker_event_tx,
+                &worker_atomics,
+                normalization_enabled,
+                device_rate,
+                device_channels,
+            ),
+            LoadIntent::Preload => handle_preload(
+                &source,
+                &meta,
+                deck,
+                generation,
+                &audio_cmd_tx,
+                &sample_tx,
+                &worker_event_tx,
+                &worker_atomics,
+                normalization_enabled,
+                device_rate,
+                device_channels,
+            ),
+        });
+
+    if let Err(error) = spawn_result {
+        let message = format!("could not start native audio loader: {error}");
+        match intent {
+            LoadIntent::Play => {
+                let _ = event_tx.send(EngineEvent::Error { message });
+            }
+            LoadIntent::Preload => {
+                atomics
+                    .preload_error_rk
+                    .store(rating_key, Ordering::Relaxed);
+                let _ = event_tx.send(EngineEvent::PreloadError {
+                    rating_key,
+                    message,
+                });
+            }
+        }
+    }
 }
 
 fn read_engine_clock(atomics: &SharedAtomics, device_sample_rate: u32) -> AudioEngineClock {
@@ -121,6 +218,7 @@ impl AudioEngine {
         let (deck_a_tx, deck_a_rx) = bounded::<SampleBatch>(SAMPLE_BATCH_CHANNEL_CAPACITY);
         let (deck_b_tx, deck_b_rx) = bounded::<SampleBatch>(SAMPLE_BATCH_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = bounded::<EngineEvent>(256);
+        let (visualizer_event_tx, visualizer_event_rx) = bounded::<VisualizerFrame>(2);
         let (vis_tx, vis_rx) = bounded::<Vec<f32>>(VISUALIZER_BUFFER_POOL_SIZE);
         let (vis_recycle_tx, vis_recycle_rx) = bounded::<Vec<f32>>(VISUALIZER_BUFFER_POOL_SIZE);
         for _ in 0..VISUALIZER_BUFFER_POOL_SIZE {
@@ -154,11 +252,13 @@ impl AudioEngine {
         let device_channels = output.channels;
         let output_device_id = output.device_id.clone();
         let output_device_name = output.device_name.clone();
+        let output_sample_format = output.sample_format.clone();
         info!(
             device = %output_device_name,
             device_id = %output_device_id,
             sample_rate = device_sample_rate,
             channels = device_channels,
+            sample_format = %output_sample_format,
             "native audio engine started"
         );
 
@@ -199,7 +299,6 @@ impl AudioEngine {
             .map_err(|error| format!("failed to start audio output holder: {error}"))?;
 
         let running_visualizer = running.clone();
-        let visualizer_events = event_tx.clone();
         std::thread::Builder::new()
             .name("heya-audio-visualizer".into())
             .spawn(move || {
@@ -217,7 +316,7 @@ impl AudioEngine {
                         let _ = vis_recycle_tx.try_send(more);
                     }
                     if let Some((time_domain, frequency_bins)) = visualizer.compute() {
-                        let _ = visualizer_events.try_send(EngineEvent::VisFrame {
+                        let _ = visualizer_event_tx.try_send(VisualizerFrame {
                             samples: time_domain,
                             frequency_bins,
                         });
@@ -251,10 +350,12 @@ impl AudioEngine {
             cmd_tx,
             atomics: clock_atomics,
             event_rx,
+            visualizer_event_rx,
             running,
             stream_ctl_tx,
             device_sample_rate,
             device_channels,
+            output_sample_format,
             output_device_id,
             output_device_name,
         })
@@ -269,6 +370,9 @@ impl AudioEngine {
     pub fn events(&self) -> Receiver<EngineEvent> {
         self.event_rx.clone()
     }
+    pub fn visualizer_events(&self) -> Receiver<VisualizerFrame> {
+        self.visualizer_event_rx.clone()
+    }
     pub fn atomics(&self) -> &Arc<SharedAtomics> {
         &self.atomics
     }
@@ -277,6 +381,9 @@ impl AudioEngine {
     }
     pub fn device_channels(&self) -> u16 {
         self.device_channels
+    }
+    pub fn output_sample_format(&self) -> &str {
+        &self.output_sample_format
     }
     pub fn output_device_id(&self) -> &str {
         &self.output_device_id
@@ -302,28 +409,6 @@ fn control_thread_main(
     let mut normalization_enabled = true;
     // Track what's preloaded on the pending deck so we can skip re-fetching
     let mut pending_rating_key: i64 = 0;
-
-    /// Read which deck is currently active from the shared atomic.
-    /// The pending deck (for preloads/next play) is always the other one.
-    fn pending_deck(atomics: &SharedAtomics) -> DeckId {
-        let active = atomics.active_deck_id.load(Ordering::Relaxed);
-        if active == 0 {
-            DeckId::B
-        } else {
-            DeckId::A
-        }
-    }
-
-    /// Eagerly update active_deck_id after sending TransitionToActive, so
-    /// subsequent commands see the correct pending deck without waiting for
-    /// the audio callback to process the swap.
-    fn set_active_eagerly(atomics: &SharedAtomics, deck: DeckId) {
-        let id = match deck {
-            DeckId::A => 0u8,
-            DeckId::B => 1u8,
-        };
-        atomics.active_deck_id.store(id, Ordering::Relaxed);
-    }
 
     let mut stream_paused = false;
     let mut idle_since: Option<Instant> = None;
@@ -357,6 +442,8 @@ fn control_thread_main(
                         // Check if the preload was truncated (stream error during download)
                         let preload_broken =
                             atomics.preload_error_rk.load(Ordering::Relaxed) == meta.rating_key;
+                        let preload_ready =
+                            atomics.preload_ready_rk.load(Ordering::Relaxed) == meta.rating_key;
                         if already_active {
                             info!(
                                 rating_key = meta.rating_key,
@@ -368,12 +455,26 @@ fn control_thread_main(
                             && pending_rating_key != 0
                             && !preload_broken
                         {
-                            info!(rating_key = meta.rating_key, "using preloaded deck");
-                            cache_ramps(&meta, &audio_cmd_tx);
-                            let _ = audio_cmd_tx
-                                .send(AudioCommand::TransitionToActive { user_skip: true });
-                            set_active_eagerly(&atomics, pending);
-                            pending_rating_key = 0;
+                            if preload_ready {
+                                info!(rating_key = meta.rating_key, "using preloaded deck");
+                                cache_ramps(&meta, &audio_cmd_tx);
+                                let _ = audio_cmd_tx.send(AudioCommand::TransitionToActive {
+                                    user_skip: true,
+                                    rating_key: meta.rating_key,
+                                    generation: deck_generation(&atomics, pending)
+                                        .load(Ordering::Acquire),
+                                });
+                                pending_rating_key = 0;
+                                atomics.preload_ready_rk.store(0, Ordering::Relaxed);
+                            } else {
+                                info!(
+                                    rating_key = meta.rating_key,
+                                    "play will activate in-flight preload when ready"
+                                );
+                                atomics
+                                    .activate_when_ready_rk
+                                    .store(meta.rating_key, Ordering::Relaxed);
+                            }
                         } else {
                             if preload_broken {
                                 warn!(
@@ -383,21 +484,29 @@ fn control_thread_main(
                                 atomics.preload_error_rk.store(0, Ordering::Relaxed);
                             }
                             let deck = pending;
-                            handle_play(
-                                &source,
-                                &meta,
+                            let generation = next_deck_generation(&atomics, deck);
+                            atomics.preload_ready_rk.store(0, Ordering::Relaxed);
+                            atomics.activate_when_ready_rk.store(0, Ordering::Relaxed);
+                            if active_rk == 0 {
+                                atomics.set_state(EngineState::Buffering);
+                                let _ = event_tx.send(EngineEvent::State {
+                                    state: "buffering".into(),
+                                });
+                            }
+                            spawn_load_job(
+                                LoadIntent::Play,
+                                source,
+                                meta,
                                 deck,
-                                &audio_cmd_tx,
-                                deck_tx(deck, &deck_a_tx, &deck_b_tx),
-                                &event_tx,
-                                &atomics,
-                                &crossfade_settings,
+                                generation,
+                                audio_cmd_tx.clone(),
+                                deck_tx(deck, &deck_a_tx, &deck_b_tx).clone(),
+                                event_tx.clone(),
+                                atomics.clone(),
                                 normalization_enabled,
                                 device_sample_rate,
                                 device_channels,
                             );
-                            // Eagerly reflect the upcoming deck swap
-                            set_active_eagerly(&atomics, deck);
                             pending_rating_key = 0;
                         }
                     }
@@ -424,15 +533,23 @@ fn control_thread_main(
                                 "PRELOAD command"
                             );
                             pending_rating_key = meta.rating_key;
-                            handle_preload(
-                                &source,
-                                &meta,
+                            atomics.preload_ready_rk.store(0, Ordering::Relaxed);
+                            atomics.activate_when_ready_rk.store(0, Ordering::Relaxed);
+                            atomics.preload_error_rk.store(0, Ordering::Relaxed);
+                            let generation = next_deck_generation(&atomics, deck);
+                            let _ = event_tx.send(EngineEvent::PreloadLoading {
+                                rating_key: meta.rating_key,
+                            });
+                            spawn_load_job(
+                                LoadIntent::Preload,
+                                source,
+                                meta,
                                 deck,
-                                &audio_cmd_tx,
-                                deck_tx(deck, &deck_a_tx, &deck_b_tx),
-                                &event_tx,
-                                &atomics,
-                                &crossfade_settings,
+                                generation,
+                                audio_cmd_tx.clone(),
+                                deck_tx(deck, &deck_a_tx, &deck_b_tx).clone(),
+                                event_tx.clone(),
+                                atomics.clone(),
                                 normalization_enabled,
                                 device_sample_rate,
                                 device_channels,
@@ -446,6 +563,11 @@ fn control_thread_main(
                         let _ = audio_cmd_tx.send(AudioCommand::Resume);
                     }
                     Command::Stop => {
+                        atomics.deck_a_generation.fetch_add(1, Ordering::Relaxed);
+                        atomics.deck_b_generation.fetch_add(1, Ordering::Relaxed);
+                        atomics.preload_ready_rk.store(0, Ordering::Relaxed);
+                        atomics.activate_when_ready_rk.store(0, Ordering::Relaxed);
+                        pending_rating_key = 0;
                         let _ = audio_cmd_tx.send(AudioCommand::Stop);
                     }
                     Command::Seek { position_ms } => {
@@ -536,6 +658,8 @@ fn control_thread_main(
                         let _ = audio_cmd_tx.send(AudioCommand::DuckAndApply { duck_ms });
                     }
                     Command::Shutdown => {
+                        atomics.deck_a_generation.fetch_add(1, Ordering::Relaxed);
+                        atomics.deck_b_generation.fetch_add(1, Ordering::Relaxed);
                         info!("audio engine control thread shutting down");
                         break;
                     }
@@ -600,11 +724,11 @@ fn handle_play(
     source: &AudioSource,
     meta: &TrackMeta,
     deck: DeckId,
+    generation: u64,
     audio_cmd_tx: &Sender<AudioCommand>,
     sample_tx: &Sender<SampleBatch>,
     event_tx: &Sender<EngineEvent>,
     atomics: &Arc<SharedAtomics>,
-    _xfade: &CrossfadeSettings,
     normalization_enabled: bool,
     device_rate: u32,
     device_channels: u16,
@@ -614,20 +738,19 @@ fn handle_play(
     // Cache ramps
     cache_ramps(meta, audio_cmd_tx);
 
-    // Set buffering state
-    atomics.set_state(EngineState::Buffering);
-    let _ = event_tx.send(EngineEvent::State {
-        state: "buffering".into(),
-    });
-
-    // Increment generation to invalidate any old bg decode threads writing to this deck
-    let generation = match deck {
-        DeckId::A => atomics.deck_a_generation.fetch_add(1, Ordering::Relaxed) + 1,
-        DeckId::B => atomics.deck_b_generation.fetch_add(1, Ordering::Relaxed) + 1,
-    };
-
-    match fetch_and_decode_incremental(source, meta.rating_key, device_rate, device_channels) {
+    let generation_signal = deck_generation(atomics, deck);
+    match fetch_and_decode_incremental(
+        source,
+        meta.rating_key,
+        device_rate,
+        device_channels,
+        generation_signal.clone(),
+        generation,
+    ) {
         Ok(result) => {
+            if generation_signal.load(Ordering::Relaxed) != generation {
+                return;
+            }
             if atomics.preload_error_rk.load(Ordering::Relaxed) == meta.rating_key {
                 atomics.preload_error_rk.store(0, Ordering::Relaxed);
             }
@@ -652,18 +775,7 @@ fn handle_play(
                 1.0
             };
 
-            // Pre-compute expected samples for pre-allocation
-            let expected_total =
-                if meta.duration_ms > 0 && result.sample_rate > 0 && result.channels > 0 {
-                    (meta.duration_ms as f64 / 1000.0
-                        * result.sample_rate as f64
-                        * result.channels as f64) as usize
-                } else {
-                    result.initial_samples.len()
-                };
-
             let sample_buffer = match allocate_pcm_buffer(
-                expected_total,
                 result.initial_samples.len(),
                 device_rate,
                 result.channels,
@@ -679,6 +791,7 @@ fn handle_play(
             // made here on the control thread, not inside the audio callback.
             let _ = audio_cmd_tx.send(AudioCommand::LoadDeck {
                 deck,
+                generation,
                 meta: meta.clone(),
                 sample_rate: result.sample_rate,
                 channels: result.channels,
@@ -688,7 +801,6 @@ fn handle_play(
 
             // Don't mark as fully decoded if the stream was truncated
             let fully_decoded = !has_more && !result.aborted;
-
             // Send initial samples
             let _ = sample_tx.send(SampleBatch {
                 rating_key: meta.rating_key,
@@ -697,8 +809,16 @@ fn handle_play(
                 fully_decoded,
             });
 
+            if generation_signal.load(Ordering::Acquire) != generation {
+                return;
+            }
+
             // Tell audio callback to swap pending → active
-            let _ = audio_cmd_tx.send(AudioCommand::TransitionToActive { user_skip: true });
+            let _ = audio_cmd_tx.send(AudioCommand::TransitionToActive {
+                user_skip: true,
+                rating_key: meta.rating_key,
+                generation,
+            });
 
             // Continue decoding in background
             if let Some(decoder) = result.decoder {
@@ -711,6 +831,7 @@ fn handle_play(
                     deck,
                     generation,
                     sample_tx.clone(),
+                    event_tx.clone(),
                     atomics.clone(),
                     device_rate,
                     device_channels,
@@ -725,6 +846,9 @@ fn handle_play(
             }
         }
         Err(e) => {
+            if generation_signal.load(Ordering::Relaxed) != generation {
+                return;
+            }
             warn!(rating_key = meta.rating_key, error = %e, "play failed");
             let _ = event_tx.send(EngineEvent::Error {
                 message: format!("load failed: {}", e),
@@ -738,11 +862,11 @@ fn handle_preload(
     source: &AudioSource,
     meta: &TrackMeta,
     deck: DeckId,
+    generation: u64,
     audio_cmd_tx: &Sender<AudioCommand>,
     sample_tx: &Sender<SampleBatch>,
     event_tx: &Sender<EngineEvent>,
     atomics: &Arc<SharedAtomics>,
-    _xfade: &CrossfadeSettings,
     normalization_enabled: bool,
     device_rate: u32,
     device_channels: u16,
@@ -751,14 +875,19 @@ fn handle_preload(
 
     cache_ramps(meta, audio_cmd_tx);
 
-    // Increment generation to invalidate any old bg decode threads writing to this deck
-    let generation = match deck {
-        DeckId::A => atomics.deck_a_generation.fetch_add(1, Ordering::Relaxed) + 1,
-        DeckId::B => atomics.deck_b_generation.fetch_add(1, Ordering::Relaxed) + 1,
-    };
-
-    match fetch_and_decode_incremental(source, meta.rating_key, device_rate, device_channels) {
+    let generation_signal = deck_generation(atomics, deck);
+    match fetch_and_decode_incremental(
+        source,
+        meta.rating_key,
+        device_rate,
+        device_channels,
+        generation_signal.clone(),
+        generation,
+    ) {
         Ok(result) => {
+            if generation_signal.load(Ordering::Relaxed) != generation {
+                return;
+            }
             if atomics.preload_error_rk.load(Ordering::Relaxed) == meta.rating_key {
                 atomics.preload_error_rk.store(0, Ordering::Relaxed);
             }
@@ -781,17 +910,7 @@ fn handle_preload(
                 1.0
             };
 
-            let expected_total =
-                if meta.duration_ms > 0 && result.sample_rate > 0 && result.channels > 0 {
-                    (meta.duration_ms as f64 / 1000.0
-                        * result.sample_rate as f64
-                        * result.channels as f64) as usize
-                } else {
-                    result.initial_samples.len()
-                };
-
             let sample_buffer = match allocate_pcm_buffer(
-                expected_total,
                 result.initial_samples.len(),
                 device_rate,
                 result.channels,
@@ -811,6 +930,7 @@ fn handle_preload(
 
             let _ = audio_cmd_tx.send(AudioCommand::LoadDeck {
                 deck,
+                generation,
                 meta: meta.clone(),
                 sample_rate: result.sample_rate,
                 channels: result.channels,
@@ -819,6 +939,12 @@ fn handle_preload(
             });
 
             let fully_decoded = !has_more && !result.aborted;
+            let initial_buffered_ms = if result.sample_rate == 0 || result.channels == 0 {
+                0
+            } else {
+                (result.initial_samples.len() as u64).saturating_mul(1000)
+                    / (u64::from(result.sample_rate) * u64::from(result.channels))
+            };
 
             let _ = sample_tx.send(SampleBatch {
                 rating_key: meta.rating_key,
@@ -827,11 +953,41 @@ fn handle_preload(
                 fully_decoded,
             });
 
+            if generation_signal.load(Ordering::Acquire) != generation {
+                return;
+            }
+
+            if !result.aborted {
+                atomics
+                    .preload_ready_rk
+                    .store(meta.rating_key, Ordering::Release);
+                let _ = event_tx.send(EngineEvent::PreloadReady {
+                    rating_key: meta.rating_key,
+                    buffered_ms: initial_buffered_ms,
+                });
+                if atomics
+                    .activate_when_ready_rk
+                    .compare_exchange(meta.rating_key, 0, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    atomics.preload_ready_rk.store(0, Ordering::Relaxed);
+                    let _ = audio_cmd_tx.send(AudioCommand::TransitionToActive {
+                        user_skip: true,
+                        rating_key: meta.rating_key,
+                        generation,
+                    });
+                }
+            }
+
             if result.aborted {
                 warn!(rating_key = meta.rating_key, "preload stream was truncated");
                 atomics
                     .preload_error_rk
                     .store(meta.rating_key, Ordering::Relaxed);
+                let _ = event_tx.send(EngineEvent::PreloadError {
+                    rating_key: meta.rating_key,
+                    message: "preload stream was truncated".into(),
+                });
             }
 
             debug!(rating_key = meta.rating_key, "preload initial batch ready");
@@ -847,6 +1003,7 @@ fn handle_preload(
                     deck,
                     generation,
                     sample_tx.clone(),
+                    event_tx.clone(),
                     atomics.clone(),
                     device_rate,
                     device_channels,
@@ -854,6 +1011,9 @@ fn handle_preload(
             }
         }
         Err(e) => {
+            if generation_signal.load(Ordering::Relaxed) != generation {
+                return;
+            }
             warn!(rating_key = meta.rating_key, error = %e, "preload failed");
             atomics
                 .preload_error_rk
@@ -899,6 +1059,7 @@ fn spawn_background_decode(
     deck: DeckId,
     generation: u64,
     sample_tx: Sender<SampleBatch>,
+    event_tx: Sender<EngineEvent>,
     atomics: Arc<SharedAtomics>,
     device_sample_rate: u32,
     device_channels: u16,
@@ -918,12 +1079,14 @@ fn spawn_background_decode(
             let batch_size =
                 source_rate as usize * source_channels as usize * BACKGROUND_DECODE_BATCH_SECONDS;
             let mut current_gen = generation;
+            let mut at_eof = false;
 
             loop {
                 // Check for seek request
                 let seek_ms = seek_signal.load(Ordering::Relaxed);
                 if seek_ms >= 0 {
                     seek_signal.store(-1, Ordering::Relaxed);
+                    current_gen = gen_signal.load(Ordering::Acquire);
                     let seek_secs = seek_ms as f64 / 1000.0;
                     log::info!(
                         "native audio decoder seek started track={} deck={:?} position_seconds={seek_secs:.3}",
@@ -951,15 +1114,28 @@ fn spawn_background_decode(
                         Ok(seeked) => {
                             decoder.decoder.reset();
                             decoder.finished = false;
+                            at_eof = false;
                             if source_rate != device_sample_rate {
-                                resampler = Some(StreamingResampler::new(
+                                resampler = match StreamingResampler::new(
                                     source_channels,
                                     source_rate,
                                     device_sample_rate,
-                                ));
+                                ) {
+                                    Ok(resampler) => Some(resampler),
+                                    Err(error) => {
+                                        warn!(rating_key, %error, "could not reset resampler after seek");
+                                        report_decode_failure(
+                                            &event_tx,
+                                            &atomics,
+                                            &gen_signal,
+                                            current_gen,
+                                            rating_key,
+                                            format!("could not reset resampler after seek: {error}"),
+                                        );
+                                        return;
+                                    }
+                                };
                             }
-                            // Update generation — new batches get the new generation
-                            current_gen = gen_signal.load(Ordering::Relaxed);
                             debug!(
                                 rating_key,
                                 seeked_ts = seeked.actual_ts,
@@ -983,6 +1159,15 @@ fn spawn_background_decode(
                                 deck,
                                 e,
                             );
+                            report_decode_failure(
+                                &event_tx,
+                                &atomics,
+                                &gen_signal,
+                                current_gen,
+                                rating_key,
+                                format!("audio seek failed: {e}"),
+                            );
+                            return;
                         }
                     }
                 }
@@ -995,10 +1180,33 @@ fn spawn_background_decode(
                     return;
                 }
 
+                // Keep the decoder alive after EOF so a later backward seek
+                // can refill the bounded PCM ring without retaining the whole
+                // decoded track. The generation check above still tears this
+                // worker down immediately when its physical deck is reused.
+                if at_eof {
+                    std::thread::park_timeout(Duration::from_millis(20));
+                    continue;
+                }
+
                 match decode::decode_batch(&mut decoder, batch_size) {
                     Ok(batch) if !batch.is_empty() => {
                         let mut samples = if let Some(resampler) = resampler.as_mut() {
-                            resampler.process(&batch)
+                            match resampler.process(&batch) {
+                                Ok(samples) => samples,
+                                Err(error) => {
+                                    warn!(rating_key, %error, "background resampling failed");
+                                    report_decode_failure(
+                                        &event_tx,
+                                        &atomics,
+                                        &gen_signal,
+                                        current_gen,
+                                        rating_key,
+                                        format!("background resampling failed: {error}"),
+                                    );
+                                    return;
+                                }
+                            }
                         } else {
                             batch
                         };
@@ -1030,14 +1238,34 @@ fn spawn_background_decode(
                             // as fully decoded so is_finished() won't fire and
                             // cause premature auto-advance.
                             warn!(rating_key, "bg decode: incomplete (stream truncated)");
-                            atomics
-                                .preload_error_rk
-                                .store(rating_key, Ordering::Relaxed);
+                            report_decode_failure(
+                                &event_tx,
+                                &atomics,
+                                &gen_signal,
+                                current_gen,
+                                rating_key,
+                                "audio stream was truncated".into(),
+                            );
                         } else {
                             debug!(rating_key, "bg decode: complete");
-                            let mut samples = resampler
-                                .as_mut()
-                                .map_or_else(Vec::new, StreamingResampler::finish);
+                            let mut samples = match resampler.as_mut() {
+                                Some(resampler) => match resampler.finish() {
+                                    Ok(samples) => samples,
+                                    Err(error) => {
+                                        warn!(rating_key, %error, "could not flush audio resampler");
+                                        report_decode_failure(
+                                            &event_tx,
+                                            &atomics,
+                                            &gen_signal,
+                                            current_gen,
+                                            rating_key,
+                                            format!("could not flush audio resampler: {error}"),
+                                        );
+                                        return;
+                                    }
+                                },
+                                None => Vec::new(),
+                            };
                             if source_channels == 1 && device_channels >= 2 {
                                 let mut stereo = Vec::with_capacity(samples.len() * 2);
                                 for &sample in &samples {
@@ -1051,20 +1279,52 @@ fn spawn_background_decode(
                                 samples,
                                 fully_decoded: true,
                             });
+                            at_eof = true;
+                            continue;
                         }
                         return;
                     }
                     Err(e) => {
                         warn!(rating_key, error = %e, "bg decode: error");
-                        atomics
-                            .preload_error_rk
-                            .store(rating_key, Ordering::Relaxed);
+                        report_decode_failure(
+                            &event_tx,
+                            &atomics,
+                            &gen_signal,
+                            current_gen,
+                            rating_key,
+                            format!("background decode failed: {e}"),
+                        );
                         return;
                     }
                 }
             }
         })
         .ok();
+}
+
+fn report_decode_failure(
+    event_tx: &Sender<EngineEvent>,
+    atomics: &SharedAtomics,
+    generation_signal: &AtomicU64,
+    generation: u64,
+    rating_key: i64,
+    message: String,
+) {
+    if generation_signal.load(Ordering::Acquire) != generation {
+        return;
+    }
+    atomics
+        .preload_error_rk
+        .store(rating_key, Ordering::Release);
+    let event = if atomics.active_rating_key.load(Ordering::Acquire) == rating_key {
+        EngineEvent::Error { message }
+    } else {
+        EngineEvent::PreloadError {
+            rating_key,
+            message,
+        }
+    };
+    let _ = event_tx.send(event);
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,10 +1351,13 @@ fn fetch_and_decode_incremental(
     rating_key: i64,
     device_rate: u32,
     device_channels: u16,
+    generation_signal: Arc<AtomicU64>,
+    generation: u64,
 ) -> Result<IncrementalDecodeResult, String> {
     use self::deck::streaming::{SharedBuffer, StreamingReader};
 
-    let shared = SharedBuffer::new(None);
+    let shared = SharedBuffer::new(None)
+        .map_err(|error| format!("could not create audio download spool: {error}"))?;
     let writer = shared.clone();
     let source = source.clone();
     // Symphonia's demuxers determine seekability while probing. Do not race
@@ -1106,8 +1369,14 @@ fn fetch_and_decode_incremental(
     std::thread::Builder::new()
         .name(format!("heya-audio-fetch-{rating_key}"))
         .spawn(move || {
+            if generation_signal.load(Ordering::Relaxed) != generation {
+                let _ = response_ready_tx.send(Err("native audio load was cancelled"));
+                writer.abort();
+                return;
+            }
             let client = match reqwest::blocking::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
+                .timeout(Duration::from_secs(60))
                 .redirect(reqwest::redirect::Policy::none())
                 .user_agent(format!("HeyaClient/{}", env!("CARGO_PKG_VERSION")))
                 .build()
@@ -1152,12 +1421,23 @@ fn fetch_and_decode_incremental(
             }
             let content_length = response.content_length();
             if let Some(length) = content_length {
+                if length > MAX_COMPRESSED_SPOOL_BYTES {
+                    let _ = response_ready_tx.send(Err("native audio source is too large"));
+                    writer.abort();
+                    return;
+                }
                 writer.set_content_length(length);
                 let _ = response_ready_tx.send(Ok(length));
             }
             let mut chunk = vec![0_u8; 128 * 1024];
             let mut received = 0_u64;
             loop {
+                if generation_signal.load(Ordering::Relaxed) != generation
+                    || writer.is_abandoned()
+                {
+                    writer.abort();
+                    return;
+                }
                 match response.read(&mut chunk) {
                     Ok(0) => {
                         if content_length.is_none() {
@@ -1169,7 +1449,21 @@ fn fetch_and_decode_incremental(
                     }
                     Ok(count) => {
                         received = received.saturating_add(count as u64);
-                        writer.push(&chunk[..count]);
+                        if received > MAX_COMPRESSED_SPOOL_BYTES {
+                            if content_length.is_none() {
+                                let _ = response_ready_tx.send(Err("native audio source is too large"));
+                            }
+                            writer.abort();
+                            return;
+                        }
+                        if let Err(error) = writer.push(&chunk[..count]) {
+                            warn!(rating_key, kind = ?error.kind(), "could not spool native audio stream");
+                            if content_length.is_none() {
+                                let _ = response_ready_tx.send(Err("could not spool audio stream"));
+                            }
+                            writer.abort();
+                            return;
+                        }
                     }
                     Err(error) => {
                         warn!(rating_key, kind = ?error.kind(), "native audio stream was truncated");
@@ -1227,12 +1521,19 @@ fn decode_initial_batch(
         "initial decode batch ready"
     );
 
-    let mut resampler = (source_rate != device_rate)
-        .then(|| StreamingResampler::new(source_channels, source_rate, device_rate));
+    let mut resampler = if source_rate != device_rate {
+        Some(StreamingResampler::new(
+            source_channels,
+            source_rate,
+            device_rate,
+        )?)
+    } else {
+        None
+    };
     if let Some(streaming_resampler) = resampler.as_mut() {
-        samples = streaming_resampler.process(&samples);
+        samples = streaming_resampler.process(&samples)?;
         if setup.finished && !setup.aborted {
-            samples.extend(streaming_resampler.finish());
+            samples.extend(streaming_resampler.finish()?);
         }
     }
 
@@ -1266,20 +1567,23 @@ fn decode_initial_batch(
 // ---------------------------------------------------------------------------
 
 fn allocate_pcm_buffer(
-    expected_samples: usize,
     initial_samples: usize,
     sample_rate: u32,
     channels: u16,
 ) -> Result<Vec<f32>, String> {
-    let headroom =
-        sample_rate as usize * channels.max(1) as usize * BACKGROUND_DECODE_BATCH_SECONDS;
-    let capacity = expected_samples
-        .max(initial_samples)
-        .saturating_add(headroom);
+    let capacity = (sample_rate as usize)
+        .saturating_mul(channels.max(1) as usize)
+        .saturating_mul(PCM_BUFFER_SECONDS)
+        .max(initial_samples);
     let mut buffer = Vec::new();
     buffer
         .try_reserve_exact(capacity)
         .map_err(|_| "could not reserve decoded PCM memory for this track".to_string())?;
+    // Commit and initialize the ring's pages on the loader thread. Growing a
+    // merely-reserved Vec from the audio callback can fault in memory and
+    // create exactly the sort of intermittent deadline miss this buffer is
+    // intended to prevent.
+    buffer.resize(capacity, 0.0);
     Ok(buffer)
 }
 
@@ -1342,5 +1646,14 @@ mod tests {
         assert!(!should_ignore_duplicate_preload(42, 42, 0, 42));
         assert!(!should_ignore_duplicate_preload(42, 7, 42, 42));
         assert!(!should_ignore_duplicate_preload(42, 7, 0, 43));
+    }
+
+    #[test]
+    fn pcm_allocation_is_bounded_at_a_96khz_device_rate() {
+        let buffer = allocate_pcm_buffer(96_000 * 2 * INITIAL_DECODE_SECONDS, 96_000, 2)
+            .expect("allocate PCM ring backing");
+        assert_eq!(buffer.len(), 96_000 * 2 * PCM_BUFFER_SECONDS);
+        assert!(buffer.capacity() >= buffer.len());
+        assert!(buffer.capacity() < 96_000 * 2 * (PCM_BUFFER_SECONDS + 1));
     }
 }

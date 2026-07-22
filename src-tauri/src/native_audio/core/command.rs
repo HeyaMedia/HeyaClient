@@ -109,6 +109,9 @@ pub enum AudioCommand {
     /// Prepare a deck for a new track (resets buffer, sets metadata).
     LoadDeck {
         deck: DeckId,
+        /// Cancellation generation assigned before the loader starts. The
+        /// callback rejects a late command from a superseded worker.
+        generation: u64,
         meta: TrackMeta,
         sample_rate: u32,
         channels: u16,
@@ -125,6 +128,8 @@ pub enum AudioCommand {
     /// Swap pending → active. Audio callback computes crossfade plan internally.
     TransitionToActive {
         user_skip: bool,
+        rating_key: i64,
+        generation: u64,
     },
 
     // -- Seek --

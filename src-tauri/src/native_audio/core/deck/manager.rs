@@ -5,6 +5,144 @@
 
 use super::super::types::{DeckId, TrackMeta};
 
+/// Fixed-capacity interleaved PCM ring. Its backing allocation is created off
+/// the real-time thread, then reused as tracks advance so decoded audio cannot
+/// grow to the size of an entire album track.
+#[derive(Debug)]
+pub struct PcmRing {
+    storage: Vec<f32>,
+    read: usize,
+    write: usize,
+    queued: usize,
+}
+
+impl PcmRing {
+    pub fn new() -> Self {
+        Self {
+            storage: Vec::new(),
+            read: 0,
+            write: 0,
+            queued: 0,
+        }
+    }
+
+    pub fn from_storage(storage: Vec<f32>) -> Self {
+        Self {
+            storage,
+            read: 0,
+            write: 0,
+            queued: 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn from_samples(samples: Vec<f32>) -> Self {
+        let queued = samples.len();
+        let write = if samples.capacity() == 0 {
+            0
+        } else {
+            queued % samples.capacity()
+        };
+        Self {
+            storage: samples,
+            read: 0,
+            write,
+            queued,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn to_vec(&self) -> Vec<f32> {
+        (0..self.queued)
+            .filter_map(|index| self.get(index))
+            .collect()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.storage.capacity()
+    }
+
+    pub fn len(&self) -> usize {
+        self.queued
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queued == 0
+    }
+
+    pub fn free(&self) -> usize {
+        self.capacity().saturating_sub(self.queued)
+    }
+
+    pub fn get(&self, offset: usize) -> Option<f32> {
+        if offset >= self.queued || self.capacity() == 0 {
+            return None;
+        }
+        self.storage
+            .get((self.read + offset) % self.capacity())
+            .copied()
+    }
+
+    pub fn push(&mut self, samples: &[f32]) -> bool {
+        if samples.len() > self.free() {
+            return false;
+        }
+        let capacity = self.capacity();
+        if samples.is_empty() {
+            return true;
+        }
+
+        let mut copied = 0;
+        while copied < samples.len() {
+            let writable = (capacity - self.write).min(samples.len() - copied);
+            let initialized = self.storage.len().saturating_sub(self.write).min(writable);
+            if initialized > 0 {
+                self.storage[self.write..self.write + initialized]
+                    .copy_from_slice(&samples[copied..copied + initialized]);
+                self.write = (self.write + initialized) % capacity;
+                copied += initialized;
+                continue;
+            }
+
+            // Until the first wrap, grow the Vec into its pre-reserved backing.
+            let grow = writable.min(capacity.saturating_sub(self.storage.len()));
+            debug_assert!(grow > 0);
+            self.storage
+                .extend_from_slice(&samples[copied..copied + grow]);
+            self.write = (self.write + grow) % capacity;
+            copied += grow;
+        }
+        self.queued += samples.len();
+        true
+    }
+
+    pub fn consume(&mut self, samples: usize) -> usize {
+        let consumed = samples.min(self.queued);
+        if self.capacity() > 0 {
+            self.read = (self.read + consumed) % self.capacity();
+        }
+        self.queued -= consumed;
+        consumed
+    }
+
+    pub fn clear(&mut self) {
+        self.read = 0;
+        self.write = 0;
+        self.queued = 0;
+    }
+
+    pub fn replace_storage(&mut self, storage: Vec<f32>) -> Vec<f32> {
+        let old = std::mem::replace(self, Self::from_storage(storage));
+        old.storage
+    }
+}
+
+impl Default for PcmRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Active crossfade curve state — the mixer steps through this per-frame.
 #[derive(Debug, Clone)]
 pub struct FadeCurve {
@@ -61,9 +199,7 @@ impl FadeCurve {
 #[derive(Debug)]
 pub struct DeckState {
     /// Decoded audio samples (interleaved f32).
-    pub samples: Vec<f32>,
-    /// Current read position in samples (interleaved index).
-    pub position: usize,
+    pub samples: PcmRing,
     /// Track metadata (None if deck is empty).
     pub meta: Option<TrackMeta>,
     /// Sample rate of the decoded audio.
@@ -80,11 +216,10 @@ pub struct DeckState {
     pub norm_gain: f32,
     /// Active crossfade curve (if any). The mixer reads and advances this.
     pub fade_curve: Option<FadeCurve>,
-    /// True once the entire track has been decoded into `samples`.
+    /// True once the decoder reached a clean end-of-stream.
     pub fully_decoded: bool,
-    /// Sample offset — after a seek, the buffer is cleared and this is set to
-    /// the sample index where the new buffer starts. `position_secs()` adds
-    /// this offset to compute the real track position.
+    /// Absolute interleaved sample position of the ring's current read cursor.
+    /// Advancing playback increments it; seeking resets it to the target.
     pub sample_offset: usize,
     /// Seek generation counter — incremented on each seek. Background decode
     /// threads stamp their `SampleBatch` with the generation at the time of
@@ -95,8 +230,7 @@ pub struct DeckState {
 impl DeckState {
     pub fn new(_id: DeckId) -> Self {
         Self {
-            samples: Vec::new(),
-            position: 0,
+            samples: PcmRing::new(),
             meta: None,
             sample_rate: 44100,
             channels: 2,
@@ -114,7 +248,6 @@ impl DeckState {
     /// Reset deck for reuse with a new track.
     pub fn reset(&mut self) {
         self.samples.clear();
-        self.position = 0;
         self.sample_offset = 0;
         self.meta = None;
         self.loaded = false;
@@ -131,8 +264,7 @@ impl DeckState {
         if self.channels == 0 || self.sample_rate == 0 {
             return 0.0;
         }
-        (self.sample_offset + self.position) as f32
-            / (self.sample_rate as f32 * self.channels as f32)
+        self.sample_offset as f32 / (self.sample_rate as f32 * self.channels as f32)
     }
 
     /// Total duration in seconds.
@@ -152,7 +284,8 @@ impl DeckState {
         if self.channels == 0 || self.sample_rate == 0 {
             return 0.0;
         }
-        self.samples.len() as f32 / (self.sample_rate as f32 * self.channels as f32)
+        (self.sample_offset + self.samples.len()) as f32
+            / (self.sample_rate as f32 * self.channels as f32)
     }
 
     /// Whether the deck has reached the end of the track.
@@ -160,7 +293,7 @@ impl DeckState {
     /// has been decoded. During incremental/streaming decode, the mixer may
     /// temporarily be at the end of the buffer while more samples are coming.
     pub fn is_finished(&self) -> bool {
-        self.loaded && self.fully_decoded && self.position >= self.samples.len()
+        self.loaded && self.fully_decoded && self.samples.is_empty()
     }
 
     /// Milliseconds of decoded PCM available ahead of the read cursor.
@@ -168,7 +301,7 @@ impl DeckState {
         if self.channels == 0 || self.sample_rate == 0 {
             return 0;
         }
-        let remaining = self.samples.len().saturating_sub(self.position) as u64;
+        let remaining = self.samples.len() as u64;
         remaining.saturating_mul(1000) / (u64::from(self.sample_rate) * u64::from(self.channels))
     }
 
@@ -275,13 +408,14 @@ mod tests {
         let mut deck = DeckState::new(DeckId::A);
         deck.sample_rate = 44100;
         deck.channels = 2;
-        deck.samples = vec![0.0; 44100 * 2]; // 1 second stereo
+        deck.samples = PcmRing::from_samples(vec![0.0; 44100 * 2]); // 1 second stereo
         deck.loaded = true;
 
         assert!((deck.duration_secs() - 1.0).abs() < 0.01);
         assert!((deck.position_secs() - 0.0).abs() < 0.01);
 
-        deck.position = 44100; // 0.5s into stereo buffer
+        deck.samples.consume(44100); // 0.5s into stereo buffer
+        deck.sample_offset = 44100;
         assert!((deck.position_secs() - 0.5).abs() < 0.01);
     }
 
@@ -300,20 +434,33 @@ mod tests {
         let mut deck = DeckState::new(DeckId::A);
         deck.sample_rate = 48_000;
         deck.channels = 2;
-        deck.samples = vec![0.0; 48_000 * 2 * 3];
-        deck.position = 48_000 * 2;
+        deck.samples = PcmRing::from_samples(vec![0.0; 48_000 * 2 * 3]);
+        let consumed = deck.samples.consume(48_000 * 2);
+        deck.sample_offset += consumed;
         assert_eq!(deck.buffered_ahead_ms(), 2_000);
     }
 
     #[test]
     fn reset_clears_deck() {
         let mut deck = DeckState::new(DeckId::A);
-        deck.samples = vec![1.0; 1000];
-        deck.position = 500;
+        deck.samples = PcmRing::from_samples(vec![1.0; 1000]);
+        deck.sample_offset = 500;
         deck.loaded = true;
         deck.reset();
         assert!(deck.samples.is_empty());
-        assert_eq!(deck.position, 0);
+        assert_eq!(deck.sample_offset, 0);
         assert!(!deck.loaded);
+    }
+
+    #[test]
+    fn pcm_ring_reuses_consumed_capacity_after_wrapping() {
+        let mut storage = Vec::with_capacity(6);
+        storage.shrink_to(6);
+        let mut ring = PcmRing::from_storage(storage);
+        assert!(ring.push(&[1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(ring.consume(3), 3);
+        assert!(ring.push(&[5.0, 6.0, 7.0, 8.0]));
+        assert_eq!(ring.to_vec(), vec![4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert!(!ring.push(&[9.0, 10.0]));
     }
 }

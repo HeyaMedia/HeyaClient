@@ -1,11 +1,12 @@
 //! Streaming audio source — bridges async HTTP download with sync symphonia Read.
 //!
-//! The async downloader appends chunks to a shared buffer. The sync reader
-//! blocks until the requested bytes are available. Since we keep all bytes,
-//! seeking within the already-downloaded region works instantly. Seeking beyond
-//! the downloaded region blocks until enough data arrives.
+//! The downloader appends chunks to an anonymous temporary file. The sync
+//! reader blocks until requested bytes are available. This keeps the source
+//! seekable for Symphonia without retaining an entire FLAC/M4A in RAM; the OS
+//! removes the temporary file when the last handle closes.
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -13,7 +14,8 @@ use symphonia::core::io::MediaSource;
 
 /// Shared state between the async downloader and the sync reader.
 struct Inner {
-    data: Vec<u8>,
+    file: File,
+    downloaded_len: u64,
     done: bool,
     /// True when the download was aborted due to an error (not a clean finish).
     /// The reader returns `ConnectionAborted` instead of normal EOF so the
@@ -23,44 +25,46 @@ struct Inner {
     content_length: Option<u64>,
 }
 
-/// Thread-safe shared buffer. The downloader writes to it, the decoder reads from it.
+/// Thread-safe, seekable spool. The downloader writes to it and the decoder
+/// reads from it using independent logical positions under a short mutex.
 ///
 /// When the reader side (StreamingReader) is dropped (e.g. track skipped),
-/// the `abandoned` flag is set. Subsequent `push()` calls skip the in-memory
-/// accumulation — the download task should keep writing to disk (cache) only.
+/// the `abandoned` flag is set so the HTTP worker can stop promptly.
 pub struct SharedBuffer {
     inner: Mutex<Inner>,
     condvar: Condvar,
-    /// Set to `true` when the StreamingReader is dropped. `push()` skips
-    /// in-memory accumulation but the download task can continue for caching.
+    /// Set to `true` when the StreamingReader is dropped.
     abandoned: AtomicBool,
 }
 
 impl SharedBuffer {
-    pub fn new(content_length: Option<u64>) -> Arc<Self> {
-        let capacity = content_length.unwrap_or(10 * 1024 * 1024) as usize;
-        Arc::new(Self {
+    pub fn new(content_length: Option<u64>) -> io::Result<Arc<Self>> {
+        let file = tempfile::tempfile()?;
+        Ok(Arc::new(Self {
             inner: Mutex::new(Inner {
-                data: Vec::with_capacity(capacity),
+                file,
+                downloaded_len: 0,
                 done: false,
                 aborted: false,
                 content_length,
             }),
             condvar: Condvar::new(),
             abandoned: AtomicBool::new(false),
-        })
+        }))
     }
 
     /// Append a chunk of bytes (called by the async downloader).
-    /// If the reader has been dropped (abandoned), skips the in-memory
-    /// accumulation to avoid wasting memory on a skipped track.
-    pub fn push(&self, chunk: &[u8]) {
+    pub fn push(&self, chunk: &[u8]) -> io::Result<()> {
         if self.abandoned.load(Ordering::Relaxed) {
-            return;
+            return Ok(());
         }
         let mut inner = self.inner.lock().unwrap();
-        inner.data.extend_from_slice(chunk);
+        let write_at = inner.downloaded_len;
+        inner.file.seek(SeekFrom::Start(write_at))?;
+        inner.file.write_all(chunk)?;
+        inner.downloaded_len = inner.downloaded_len.saturating_add(chunk.len() as u64);
         self.condvar.notify_all();
+        Ok(())
     }
 
     /// Signal that the download is complete.
@@ -79,12 +83,14 @@ impl SharedBuffer {
         self.condvar.notify_all();
     }
 
+    pub fn is_abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::Relaxed)
+    }
+
     /// Set the content length once known (from HTTP Content-Length header).
     pub fn set_content_length(&self, len: u64) {
         let mut inner = self.inner.lock().unwrap();
         inner.content_length = Some(len);
-        let remaining = len.saturating_sub(inner.data.len() as u64) as usize;
-        inner.data.reserve(remaining);
     }
 }
 
@@ -104,16 +110,13 @@ impl StreamingReader {
 impl Read for StreamingReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
-            let inner = self.buffer.inner.lock().unwrap();
-            let available = inner.data.len() as u64;
+            let mut inner = self.buffer.inner.lock().unwrap();
+            let available = inner.downloaded_len;
 
             if self.pos < available {
-                // Data available — copy what we can
-                let start = self.pos as usize;
-                let end = (start + buf.len()).min(inner.data.len());
-                let n = end - start;
-                buf[..n].copy_from_slice(&inner.data[start..end]);
-                drop(inner);
+                let readable = available.saturating_sub(self.pos).min(buf.len() as u64) as usize;
+                inner.file.seek(SeekFrom::Start(self.pos))?;
+                let n = inner.file.read(&mut buf[..readable])?;
                 self.pos += n as u64;
                 return Ok(n);
             }
@@ -135,7 +138,7 @@ impl Read for StreamingReader {
             let _inner = self
                 .buffer
                 .condvar
-                .wait_while(inner, |i| (i.data.len() as u64) <= self.pos && !i.done)
+                .wait_while(inner, |i| i.downloaded_len <= self.pos && !i.done)
                 .unwrap();
         }
     }
@@ -144,7 +147,7 @@ impl Read for StreamingReader {
 impl Seek for StreamingReader {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         let inner = self.buffer.inner.lock().unwrap();
-        let len = inner.data.len() as u64;
+        let len = inner.downloaded_len;
         let content_len = inner.content_length.unwrap_or(len);
         drop(inner);
 
@@ -168,8 +171,7 @@ impl Seek for StreamingReader {
 
 impl Drop for StreamingReader {
     fn drop(&mut self) {
-        // Signal that the reader is done — push() will skip memory accumulation.
-        // The download task can continue for caching purposes.
+        // Signal that the reader is done so the HTTP worker can cancel.
         self.buffer.abandoned.store(true, Ordering::Relaxed);
         // Wake any blocked push() or finish() waiting on the condvar
         self.buffer.condvar.notify_all();
@@ -194,9 +196,9 @@ mod tests {
 
     #[test]
     fn basic_write_read() {
-        let buf = SharedBuffer::new(None);
-        buf.push(b"hello");
-        buf.push(b" world");
+        let buf = SharedBuffer::new(None).unwrap();
+        buf.push(b"hello").unwrap();
+        buf.push(b" world").unwrap();
         buf.finish();
 
         let mut reader = StreamingReader::new(buf);
@@ -207,8 +209,8 @@ mod tests {
 
     #[test]
     fn seek_within_buffer() {
-        let buf = SharedBuffer::new(None);
-        buf.push(b"0123456789");
+        let buf = SharedBuffer::new(None).unwrap();
+        buf.push(b"0123456789").unwrap();
         buf.finish();
 
         let mut reader = StreamingReader::new(buf);
@@ -225,13 +227,13 @@ mod tests {
 
     #[test]
     fn concurrent_write_read() {
-        let buf = SharedBuffer::new(None);
+        let buf = SharedBuffer::new(None).unwrap();
         let buf_clone = buf.clone();
 
         let writer = std::thread::spawn(move || {
             for i in 0..10 {
                 std::thread::sleep(std::time::Duration::from_millis(5));
-                buf_clone.push(format!("{}", i).as_bytes());
+                buf_clone.push(format!("{}", i).as_bytes()).unwrap();
             }
             buf_clone.finish();
         });

@@ -30,6 +30,7 @@ const TRANSITION_READY_MS: u64 = REBUFFER_TARGET_MS;
 
 struct DeferredDeckLoad {
     deck: DeckId,
+    generation: u64,
     meta: super::types::TrackMeta,
     sample_rate: u32,
     channels: u16,
@@ -56,6 +57,10 @@ pub struct SharedAtomics {
     pub deck_b_seek_ms: Arc<AtomicI64>,
     pub deck_a_generation: Arc<AtomicU64>,
     pub deck_b_generation: Arc<AtomicU64>,
+    /// Track whose initial pending-deck PCM has been prepared.
+    pub preload_ready_rk: Arc<AtomicI64>,
+    /// Manual play/next request waiting for an in-flight preload to become ready.
+    pub activate_when_ready_rk: Arc<AtomicI64>,
     /// Rating key of the last preload that failed (stream error / truncated).
     /// Written by bg decode or control thread on error, read by PLAY handler
     /// to avoid using a broken preload.
@@ -75,6 +80,8 @@ impl SharedAtomics {
             deck_b_seek_ms: Arc::new(AtomicI64::new(-1)),
             deck_a_generation: Arc::new(AtomicU64::new(0)),
             deck_b_generation: Arc::new(AtomicU64::new(0)),
+            preload_ready_rk: Arc::new(AtomicI64::new(0)),
+            activate_when_ready_rk: Arc::new(AtomicI64::new(0)),
             preload_error_rk: Arc::new(AtomicI64::new(0)),
         }
     }
@@ -110,6 +117,9 @@ pub struct AudioCallbackState {
     crossfade_remaining_frames: u64,
     crossfade_uses_curves: bool,
     deferred_deck_load: Option<DeferredDeckLoad>,
+    deferred_transition: Option<(i64, u64, bool)>,
+    deferred_sample_a: Option<SampleBatch>,
+    deferred_sample_b: Option<SampleBatch>,
     pub normalization_enabled: bool,
     paused: bool,
 
@@ -165,6 +175,9 @@ impl AudioCallbackState {
             crossfade_remaining_frames: 0,
             crossfade_uses_curves: false,
             deferred_deck_load: None,
+            deferred_transition: None,
+            deferred_sample_a: None,
+            deferred_sample_b: None,
             normalization_enabled: true,
             paused: false,
 
@@ -214,14 +227,7 @@ impl AudioCallbackState {
         // 5. Mix decks (direct access, no lock)
         let rendered_audio = !self.paused && self.state() == EngineState::Playing;
         if rendered_audio {
-            let (active, pending) = self.deck_mgr.both_decks_mut();
-            mixer::mix_decks(
-                active,
-                pending,
-                data,
-                self.device_channels,
-                self.is_crossfading,
-            );
+            self.render_audio(data);
         }
         let output_frames = data.len() / usize::from(self.device_channels.max(1));
         if self.is_crossfading && rendered_audio {
@@ -257,6 +263,67 @@ impl AudioCallbackState {
         }
     }
 
+    /// Render one device callback. A gapless transition is allowed to occur
+    /// inside the output buffer, so the first frame after the outgoing PCM ends
+    /// comes from the incoming deck instead of being zero-filled until the next
+    /// device callback.
+    fn render_audio(&mut self, data: &mut [f32]) {
+        let output_channels = usize::from(self.device_channels.max(1));
+        let output_frames = data.len() / output_channels;
+        let split_frame = self.gapless_split_frame(output_frames);
+
+        if let Some(split_frame) = split_frame {
+            let split_sample = split_frame.saturating_mul(output_channels).min(data.len());
+            if split_sample > 0 {
+                let (active, pending) = self.deck_mgr.both_decks_mut();
+                mixer::mix_decks(
+                    active,
+                    pending,
+                    &mut data[..split_sample],
+                    self.device_channels,
+                    false,
+                );
+            }
+
+            if self.handle_gapless_transition() && split_sample < data.len() {
+                let (active, pending) = self.deck_mgr.both_decks_mut();
+                mixer::mix_decks(
+                    active,
+                    pending,
+                    &mut data[split_sample..],
+                    self.device_channels,
+                    false,
+                );
+            }
+            return;
+        }
+
+        let (active, pending) = self.deck_mgr.both_decks_mut();
+        mixer::mix_decks(
+            active,
+            pending,
+            data,
+            self.device_channels,
+            self.is_crossfading,
+        );
+    }
+
+    fn gapless_split_frame(&self, output_frames: usize) -> Option<usize> {
+        if self.is_crossfading || self.scheduler.mode() != SchedulerMode::Gapless {
+            return None;
+        }
+        let active = self.deck_mgr.active_deck();
+        if !active.loaded || !active.fully_decoded || active.channels == 0 {
+            return None;
+        }
+        if !self.pending_ready_for_transition(TRANSITION_READY_MS) {
+            return None;
+        }
+
+        let remaining_frames = active.samples.len() / usize::from(active.channels);
+        (remaining_frames <= output_frames).then_some(remaining_frames)
+    }
+
     // -----------------------------------------------------------------------
     // Sample batch draining
     // -----------------------------------------------------------------------
@@ -277,11 +344,15 @@ impl AudioCallbackState {
         while accepted_batches < MAX_SAMPLE_BATCHES_PER_DECK_CALLBACK
             && scanned_batches < MAX_SCANNED_SAMPLE_BATCHES_PER_DECK_CALLBACK
         {
-            let batch = match deck_id {
-                DeckId::A => self.deck_a_rx.try_recv(),
-                DeckId::B => self.deck_b_rx.try_recv(),
+            let deferred = match deck_id {
+                DeckId::A => self.deferred_sample_a.take(),
+                DeckId::B => self.deferred_sample_b.take(),
             };
-            let Ok(batch) = batch else {
+            let batch = deferred.or_else(|| match deck_id {
+                DeckId::A => self.deck_a_rx.try_recv().ok(),
+                DeckId::B => self.deck_b_rx.try_recv().ok(),
+            });
+            let Some(batch) = batch else {
                 break;
             };
             scanned_batches += 1;
@@ -289,9 +360,17 @@ impl AudioCallbackState {
 
             // Reject stale batches (wrong track or old seek generation)
             if deck.rating_key() != batch.rating_key || deck.generation != batch.generation {
+                let _ = self.retired_buffer_tx.try_send(batch.samples);
                 continue;
             }
-            accepted_batches += 1;
+
+            if batch.samples.len() > deck.samples.free() {
+                match deck_id {
+                    DeckId::A => self.deferred_sample_a = Some(batch),
+                    DeckId::B => self.deferred_sample_b = Some(batch),
+                }
+                break;
+            }
 
             if deck.sample_offset > 0 && deck.samples.is_empty() {
                 log::info!(
@@ -302,10 +381,13 @@ impl AudioCallbackState {
                     batch.samples.len(),
                 );
             }
-            deck.samples.extend_from_slice(&batch.samples);
+            let pushed = deck.samples.push(&batch.samples);
+            debug_assert!(pushed);
             if batch.fully_decoded {
                 deck.fully_decoded = true;
             }
+            let _ = self.retired_buffer_tx.try_send(batch.samples);
+            accepted_batches += 1;
         }
     }
 
@@ -323,6 +405,7 @@ impl AudioCallbackState {
         match cmd {
             AudioCommand::LoadDeck {
                 deck,
+                generation,
                 meta,
                 sample_rate,
                 channels,
@@ -332,6 +415,7 @@ impl AudioCallbackState {
                 if self.is_crossfading && deck == self.deck_mgr.active_id().other() {
                     let replacement = DeferredDeckLoad {
                         deck,
+                        generation,
                         meta,
                         sample_rate,
                         channels,
@@ -344,6 +428,7 @@ impl AudioCallbackState {
                 } else {
                     self.handle_load_deck(
                         deck,
+                        generation,
                         meta,
                         sample_rate,
                         channels,
@@ -370,20 +455,43 @@ impl AudioCallbackState {
             AudioCommand::Stop => {
                 self.scheduler.reset();
                 self.deck_mgr.stop_all();
+                self.discard_queued_samples();
                 self.is_crossfading = false;
                 self.crossfade_remaining_frames = 0;
                 self.crossfade_uses_curves = false;
                 if let Some(retired) = self.deferred_deck_load.take() {
                     let _ = self.retired_buffer_tx.try_send(retired.sample_buffer);
                 }
+                self.deferred_transition = None;
                 self.paused = false;
                 self.set_state(EngineState::Stopped);
                 let _ = self.event_tx.try_send(EngineEvent::State {
                     state: "stopped".into(),
                 });
             }
-            AudioCommand::TransitionToActive { user_skip } => {
-                self.handle_transition_to_active(user_skip);
+            AudioCommand::TransitionToActive {
+                user_skip,
+                rating_key,
+                generation,
+            } => {
+                let pending_id = self.deck_mgr.active_id().other();
+                let current_generation = match pending_id {
+                    DeckId::A => self.atomics.deck_a_generation.load(Ordering::Acquire),
+                    DeckId::B => self.atomics.deck_b_generation.load(Ordering::Acquire),
+                };
+                let pending = self.deck_mgr.pending_deck();
+                if current_generation == generation
+                    && pending.rating_key() == rating_key
+                    && pending.generation == generation
+                {
+                    self.handle_transition_to_active(user_skip);
+                } else if self.deferred_deck_load.as_ref().is_some_and(|load| {
+                    load.meta.rating_key == rating_key && load.generation == generation
+                }) {
+                    self.deferred_transition = Some((rating_key, generation, user_skip));
+                } else {
+                    debug!(rating_key, generation, "discarding stale deck transition");
+                }
             }
             AudioCommand::SeekInBuffer { position } => {
                 // `position` is encoded as milliseconds from the control thread
@@ -399,9 +507,11 @@ impl AudioCallbackState {
                         target_sample >= active.sample_offset && target_sample <= buffer_end;
 
                     if in_buffer {
-                        active.position = target_sample - active.sample_offset;
-                    } else if !active.fully_decoded {
-                        // Beyond buffer — need bg decode to seek
+                        let consumed = active.samples.consume(target_sample - active.sample_offset);
+                        active.sample_offset = active.sample_offset.saturating_add(consumed);
+                    } else {
+                        // Outside the bounded decoded window — ask the
+                        // persistent decoder worker to seek and refill it.
                         let out_ch = active.channels as usize;
                         let new_offset = (position_ms as f64 / 1000.0
                             * self.device_sample_rate as f64
@@ -409,7 +519,6 @@ impl AudioCallbackState {
                         let new_gen = active.generation + 1;
                         active.samples.clear();
                         active.sample_offset = new_offset;
-                        active.position = 0;
                         active.fully_decoded = false;
                         active.generation = new_gen;
 
@@ -438,12 +547,6 @@ impl AudioCallbackState {
                         let _ = self.event_tx.try_send(EngineEvent::State {
                             state: "buffering".into(),
                         });
-                    } else {
-                        // Fully decoded — clamp to buffer bounds
-                        let clamped = target_sample
-                            .saturating_sub(active.sample_offset)
-                            .min(active.samples.len());
-                        active.position = clamped;
                     }
                 }
                 self.dsp_chain.reset();
@@ -569,22 +672,51 @@ impl AudioCallbackState {
         }
     }
 
+    fn discard_queued_samples(&mut self) {
+        for batch in [self.deferred_sample_a.take(), self.deferred_sample_b.take()]
+            .into_iter()
+            .flatten()
+        {
+            let _ = self.retired_buffer_tx.try_send(batch.samples);
+        }
+        while let Ok(batch) = self.deck_a_rx.try_recv() {
+            let _ = self.retired_buffer_tx.try_send(batch.samples);
+        }
+        while let Ok(batch) = self.deck_b_rx.try_recv() {
+            let _ = self.retired_buffer_tx.try_send(batch.samples);
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Deck loading
     // -----------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_load_deck(
         &mut self,
         deck: DeckId,
+        generation: u64,
         meta: super::types::TrackMeta,
         sample_rate: u32,
         channels: u16,
         norm_gain: f32,
         sample_buffer: Vec<f32>,
     ) {
+        let current_generation = match deck {
+            DeckId::A => self.atomics.deck_a_generation.load(Ordering::Acquire),
+            DeckId::B => self.atomics.deck_b_generation.load(Ordering::Acquire),
+        };
+        if current_generation != generation {
+            let _ = self.retired_buffer_tx.try_send(sample_buffer);
+            return;
+        }
         let d = self.deck_mgr.deck_mut(deck);
         d.reset();
-        let retired = std::mem::replace(&mut d.samples, sample_buffer);
+        let retired = if d.samples.capacity() >= sample_buffer.capacity() {
+            sample_buffer
+        } else {
+            d.samples.replace_storage(sample_buffer)
+        };
         // Deallocating a previous track-sized PCM allocation can take longer
         // than an audio deadline. Hand it to a reclaimer thread instead.
         let _ = self.retired_buffer_tx.try_send(retired);
@@ -594,10 +726,7 @@ impl AudioCallbackState {
         d.loaded = true;
         d.norm_gain = norm_gain;
         // Inherit the current generation from atomics for new batches
-        d.generation = match deck {
-            DeckId::A => self.atomics.deck_a_generation.load(Ordering::Relaxed),
-            DeckId::B => self.atomics.deck_b_generation.load(Ordering::Relaxed),
-        };
+        d.generation = generation;
     }
 
     fn install_deferred_deck_load(&mut self) {
@@ -606,12 +735,27 @@ impl AudioCallbackState {
         };
         self.handle_load_deck(
             load.deck,
+            load.generation,
             load.meta,
             load.sample_rate,
             load.channels,
             load.norm_gain,
             load.sample_buffer,
         );
+        if let Some((rating_key, generation, user_skip)) = self.deferred_transition.take() {
+            let pending_id = self.deck_mgr.active_id().other();
+            let current_generation = match pending_id {
+                DeckId::A => self.atomics.deck_a_generation.load(Ordering::Acquire),
+                DeckId::B => self.atomics.deck_b_generation.load(Ordering::Acquire),
+            };
+            let pending = self.deck_mgr.pending_deck();
+            if current_generation == generation
+                && pending.rating_key() == rating_key
+                && pending.generation == generation
+            {
+                self.handle_transition_to_active(user_skip);
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -661,13 +805,18 @@ impl AudioCallbackState {
             let (active, old) = self.deck_mgr.both_decks_mut();
             apply_fade_start(active, old, &plan);
 
-            self.set_state(EngineState::Playing);
+            let transition_state = if self.paused {
+                EngineState::Paused
+            } else {
+                EngineState::Playing
+            };
+            self.set_state(transition_state);
             let _ = self.event_tx.try_send(EngineEvent::TrackStarted {
                 rating_key: new_rk,
                 duration_ms: new_dur,
             });
             let _ = self.event_tx.try_send(EngineEvent::State {
-                state: "playing".into(),
+                state: transition_state.as_str().into(),
             });
         } else {
             // Hard transition
@@ -683,13 +832,18 @@ impl AudioCallbackState {
             self.is_crossfading = false;
             self.crossfade_remaining_frames = 0;
             self.crossfade_uses_curves = false;
-            self.set_state(EngineState::Playing);
+            let transition_state = if self.paused {
+                EngineState::Paused
+            } else {
+                EngineState::Playing
+            };
+            self.set_state(transition_state);
             let _ = self.event_tx.try_send(EngineEvent::TrackStarted {
                 rating_key: new_rk,
                 duration_ms: new_dur,
             });
             let _ = self.event_tx.try_send(EngineEvent::State {
-                state: "playing".into(),
+                state: transition_state.as_str().into(),
             });
         }
 
@@ -716,7 +870,11 @@ impl AudioCallbackState {
         if let Some(action) = self.scheduler.check(pos, dur) {
             let transitioned = match action {
                 SchedulerAction::TransitionPoint => self.handle_crossfade_transition(),
-                SchedulerAction::GaplessPoint => self.handle_gapless_transition(),
+                // Metadata duration is only a hint. Exact gapless handoff is
+                // performed from decoded PCM EOF inside `render_audio`.
+                SchedulerAction::GaplessPoint => {
+                    self.deck_mgr.active_deck().is_finished() && self.handle_gapless_transition()
+                }
             };
             if !transitioned {
                 self.scheduler.retry();
@@ -741,7 +899,7 @@ impl AudioCallbackState {
             }
         } else if active.loaded
             && !active.fully_decoded
-            && active.position >= active.samples.len()
+            && active.samples.is_empty()
             && !self.is_crossfading
         {
             // Active deck ran out of samples but the track isn't fully decoded.
@@ -846,7 +1004,7 @@ impl AudioCallbackState {
     fn pending_ready_for_transition(&self, required_ms: u64) -> bool {
         let pending = self.deck_mgr.pending_deck();
         pending.loaded
-            && pending.position < pending.samples.len()
+            && !pending.samples.is_empty()
             && (pending.fully_decoded || pending.buffered_ahead_ms() >= required_ms)
     }
 
@@ -918,7 +1076,7 @@ impl AudioCallbackState {
         let active = self.deck_mgr.active_deck();
         let enough_margin =
             active.fully_decoded || active.buffered_ahead_ms() >= REBUFFER_TARGET_MS;
-        if active.loaded && active.position < active.samples.len() && enough_margin {
+        if active.loaded && !active.samples.is_empty() && enough_margin {
             self.set_state(EngineState::Playing);
             let _ = self.event_tx.try_send(EngineEvent::State {
                 state: "playing".into(),
@@ -933,8 +1091,7 @@ impl AudioCallbackState {
     fn update_position_atomics(&self) {
         let active = self.deck_mgr.active_deck();
         if active.loaded {
-            let pos =
-                (active.sample_offset + active.position) as u64 / u64::from(active.channels.max(1));
+            let pos = active.sample_offset as u64 / u64::from(active.channels.max(1));
             self.atomics.position_frames.store(pos, Ordering::Relaxed);
             let dur = active.meta.as_ref().map_or(0, |m| m.duration_ms);
             self.atomics.duration_ms.store(dur, Ordering::Relaxed);
@@ -1010,8 +1167,7 @@ impl AudioCallbackState {
             .active_rating_key
             .store(new_rk, Ordering::Relaxed);
         if active.loaded {
-            let pos =
-                (active.sample_offset + active.position) as u64 / u64::from(active.channels.max(1));
+            let pos = active.sample_offset as u64 / u64::from(active.channels.max(1));
             self.atomics.position_frames.store(pos, Ordering::Relaxed);
             let dur = active.meta.as_ref().map_or(0, |m| m.duration_ms);
             self.atomics.duration_ms.store(dur, Ordering::Relaxed);
@@ -1061,7 +1217,7 @@ impl AudioCallbackState {
 
         if window == 0 || suppress || pending.meta.as_ref().is_some_and(|m| m.skip_crossfade) {
             self.scheduler.set_mode(SchedulerMode::Gapless);
-            self.scheduler.set_transition_point(active.duration_secs());
+            self.scheduler.reset();
         } else {
             let params = self.build_crossfade_params();
             if let Some(plan) = compute_transition(&params) {
@@ -1075,7 +1231,7 @@ impl AudioCallbackState {
                 );
             } else {
                 self.scheduler.set_mode(SchedulerMode::Gapless);
-                self.scheduler.set_transition_point(active.duration_secs());
+                self.scheduler.reset();
             }
         }
     }
@@ -1208,14 +1364,17 @@ mod tests {
         channels: u16,
         samples: Vec<f32>,
     ) {
+        let sample_buffer = Vec::with_capacity(samples.len().max(1_024));
         callback.handle_command(AudioCommand::LoadDeck {
             deck,
+            generation: 0,
             meta: track,
             sample_rate,
             channels,
             norm_gain: 1.0,
-            sample_buffer: samples,
+            sample_buffer,
         });
+        assert!(callback.deck_mgr.deck_mut(deck).samples.push(&samples));
     }
 
     #[test]
@@ -1249,6 +1408,32 @@ mod tests {
             callback.scheduler.check(6.0, 10.0),
             Some(SchedulerAction::TransitionPoint)
         );
+    }
+
+    #[test]
+    fn stale_loader_cannot_swap_a_superseded_pending_deck() {
+        let (mut callback, _) = callback();
+        load(
+            &mut callback,
+            DeckId::B,
+            meta(2, 1_000, "album:2", 0.0),
+            10,
+            2,
+            vec![0.5; 20],
+        );
+        callback
+            .atomics
+            .deck_b_generation
+            .store(1, Ordering::Release);
+
+        callback.handle_command(AudioCommand::TransitionToActive {
+            user_skip: true,
+            rating_key: 2,
+            generation: 0,
+        });
+
+        assert_eq!(callback.deck_mgr.active_id(), DeckId::A);
+        assert_eq!(callback.deck_mgr.active_deck().rating_key(), 0);
     }
 
     #[test]
@@ -1454,12 +1639,18 @@ mod tests {
             smart_crossfade_max_ms: 0,
             ..CrossfadeSettings::default()
         }));
-        callback.deck_mgr.active_deck_mut().position = 20;
+        let active = callback.deck_mgr.active_deck_mut();
+        let consumed = active.samples.consume(20);
+        active.sample_offset += consumed;
 
         callback.tick_scheduler();
         assert_eq!(callback.deck_mgr.active_deck().rating_key(), 1);
 
-        callback.deck_mgr.pending_deck_mut().samples = vec![0.0; 20];
+        assert!(callback
+            .deck_mgr
+            .pending_deck_mut()
+            .samples
+            .push(&[0.0; 20]));
         callback.deck_mgr.pending_deck_mut().fully_decoded = true;
         callback.tick_scheduler();
         assert_eq!(callback.deck_mgr.active_deck().rating_key(), 2);
@@ -1495,6 +1686,48 @@ mod tests {
 
         callback.drain_deck_channel(DeckId::A);
 
-        assert_eq!(callback.deck_mgr.deck_a.samples, vec![0.5; 20]);
+        assert_eq!(callback.deck_mgr.deck_a.samples.to_vec(), vec![0.5; 20]);
+    }
+
+    #[test]
+    fn gapless_handoff_fills_the_same_device_buffer() {
+        let (mut callback, event_rx) = callback();
+        callback.device_sample_rate = 10;
+        callback.device_channels = 2;
+        load(
+            &mut callback,
+            DeckId::B,
+            meta(1, 400, "album:1", 0.0),
+            10,
+            2,
+            vec![0.25; 8],
+        );
+        callback.handle_transition_to_active(true);
+        callback.deck_mgr.active_deck_mut().fully_decoded = true;
+        load(
+            &mut callback,
+            DeckId::A,
+            meta(2, 1_000, "album:1", 0.0),
+            10,
+            2,
+            vec![0.75; 20],
+        );
+        callback.deck_mgr.pending_deck_mut().fully_decoded = true;
+        callback.handle_command(AudioCommand::UpdateCrossfadeSettings(CrossfadeSettings {
+            crossfade_window_ms: 4_000,
+            same_album_crossfade: false,
+            ..CrossfadeSettings::default()
+        }));
+
+        let mut output = vec![0.0; 12]; // Six frames: four outgoing, two incoming.
+        callback.render_audio(&mut output);
+
+        assert_eq!(&output[..8], &[0.25; 8]);
+        assert_eq!(&output[8..], &[0.75; 4]);
+        assert_eq!(callback.deck_mgr.active_deck().rating_key(), 2);
+        assert_eq!(callback.deck_mgr.active_deck().sample_offset, 4);
+        assert!(event_rx
+            .try_iter()
+            .any(|event| matches!(event, EngineEvent::TrackEnded { rating_key: 1 })));
     }
 }
