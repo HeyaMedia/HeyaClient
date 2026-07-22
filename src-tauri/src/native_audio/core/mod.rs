@@ -28,7 +28,7 @@ use self::crossfade::types::{parse_ramp, CrossfadeSettings, TrackRamps};
 use self::deck::decode;
 use self::event::EngineEvent;
 use self::output::resample::resample_buffer;
-use self::output::{CpalOutput, OutputRequest};
+use self::output::CpalOutput;
 use self::types::{AudioSource, DeckId, EngineState, TrackMeta};
 use self::visualizer::VisualizerProcessor;
 
@@ -64,6 +64,34 @@ pub struct AudioEngine {
     output_device_name: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AudioEngineClock {
+    pub state: EngineState,
+    pub position_seconds: f64,
+    pub duration_seconds: f64,
+    pub active_track_id: Option<i64>,
+}
+
+fn read_engine_clock(atomics: &SharedAtomics, device_sample_rate: u32) -> AudioEngineClock {
+    let duration_seconds = atomics.duration_ms.load(Ordering::Relaxed) as f64 / 1000.0;
+    let position_seconds = if device_sample_rate == 0 {
+        0.0
+    } else {
+        atomics.position_frames.load(Ordering::Relaxed) as f64 / f64::from(device_sample_rate)
+    };
+    let active_track_id = atomics.active_rating_key.load(Ordering::Relaxed);
+    AudioEngineClock {
+        state: atomics.get_state(),
+        position_seconds: if duration_seconds > 0.0 {
+            position_seconds.min(duration_seconds)
+        } else {
+            position_seconds
+        },
+        duration_seconds,
+        active_track_id: (active_track_id > 0).then_some(active_track_id),
+    }
+}
+
 impl Drop for AudioEngine {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Release);
@@ -74,27 +102,16 @@ impl Drop for AudioEngine {
 
 impl AudioEngine {
     pub fn start(preferred_device_id: Option<&str>) -> Result<Self, String> {
-        Self::start_with_output(OutputRequest::Shared, preferred_device_id)
+        Self::start_with_output(preferred_device_id)
     }
 
-    pub fn start_exclusive(
-        sample_rate: u32,
-        channels: u16,
-        preferred_device_id: Option<&str>,
-    ) -> Result<Self, String> {
-        Self::start_with_output(
-            OutputRequest::Exclusive {
-                sample_rate,
-                channels,
-            },
-            preferred_device_id,
-        )
+    /// Read the callback-owned PCM clock without depending on the event relay.
+    /// This is the recovery source for a dropped Rust event or WebView event.
+    pub fn clock_snapshot(&self) -> AudioEngineClock {
+        read_engine_clock(&self.atomics, self.device_sample_rate)
     }
 
-    fn start_with_output(
-        output_request: OutputRequest,
-        preferred_device_id: Option<&str>,
-    ) -> Result<Self, String> {
+    fn start_with_output(preferred_device_id: Option<&str>) -> Result<Self, String> {
         let atomics = Arc::new(SharedAtomics::new());
         let running = Arc::new(AtomicBool::new(true));
         let (cmd_tx, cmd_rx) = bounded::<Command>(64);
@@ -131,13 +148,8 @@ impl AudioEngine {
             retired_buffer_tx,
             atomics.clone(),
         );
-        let output = CpalOutput::open(
-            callback,
-            output_request,
-            preferred_device_id,
-            event_tx.clone(),
-        )
-        .map_err(|error| format!("failed to open audio output: {error}"))?;
+        let output = CpalOutput::open(callback, preferred_device_id, event_tx.clone())
+            .map_err(|error| format!("failed to open audio output: {error}"))?;
         let device_sample_rate = output.sample_rate;
         let device_channels = output.channels;
         let output_device_id = output.device_id.clone();
@@ -1284,5 +1296,24 @@ mod tests {
             rx.recv().expect("DSP reset"),
             AudioCommand::ResetDsp
         ));
+    }
+
+    #[test]
+    fn clock_snapshot_reads_the_callback_atomics_directly() {
+        let atomics = SharedAtomics::new();
+        atomics.set_state(EngineState::Playing);
+        atomics.position_frames.store(96_000, Ordering::Relaxed);
+        atomics.duration_ms.store(10_000, Ordering::Relaxed);
+        atomics.active_rating_key.store(42, Ordering::Relaxed);
+
+        assert_eq!(
+            read_engine_clock(&atomics, 48_000),
+            AudioEngineClock {
+                state: EngineState::Playing,
+                position_seconds: 2.0,
+                duration_seconds: 10.0,
+                active_track_id: Some(42),
+            }
+        );
     }
 }

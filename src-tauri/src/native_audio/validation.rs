@@ -10,16 +10,10 @@ pub struct ValidatedAudioTrack {
     pub source: AudioSource,
     pub meta: TrackMeta,
     pub start_position_seconds: Option<f64>,
-    pub codec: Option<String>,
-    pub sample_rate_hz: Option<u32>,
-    pub bit_depth: Option<u16>,
-    pub channels: Option<u16>,
-    pub lossless: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct ValidatedAudioLoad {
-    pub mode: super::AudioOutputMode,
     pub processing: super::AudioProcessingSettings,
     pub track: ValidatedAudioTrack,
 }
@@ -31,7 +25,6 @@ pub fn validate_audio_load(
     request.processing.validate()?;
     let track = validate_audio_track(server_origin, request.track)?;
     Ok(ValidatedAudioLoad {
-        mode: request.mode,
         processing: request.processing,
         track,
     })
@@ -115,34 +108,23 @@ pub fn validate_audio_track(
             silence_start_ms: request.silence_start_ms,
         },
         start_position_seconds: media.start_position_seconds(),
-        codec: request.codec,
-        sample_rate_hz: request.sample_rate_hz,
-        bit_depth: request.bit_depth,
-        channels: request.channels,
-        lossless: request.lossless,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_audio::{AudioOutputMode, AudioProcessingSettings};
+    use crate::native_audio::AudioProcessingSettings;
     use crate::native_playback::{PlaybackGrant as BridgeGrant, PlaybackLoadRequest};
 
     fn request() -> AudioLoadRequest {
         AudioLoadRequest {
-            mode: AudioOutputMode::Processed,
             processing: AudioProcessingSettings::default(),
             track: AudioTrackLoadRequest {
                 track_id: 42,
                 duration_seconds: 180.0,
                 album_key: "album:7".into(),
                 format_hint: Some("flac".into()),
-                codec: Some("flac".into()),
-                sample_rate_hz: Some(96_000),
-                bit_depth: Some(24),
-                channels: Some(2),
-                lossless: true,
                 gain_db: Some(-4.0),
                 skip_crossfade: false,
                 start_ramp: Some("-30 0;-17 0.5;-3 1.5".into()),

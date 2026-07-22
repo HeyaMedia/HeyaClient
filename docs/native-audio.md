@@ -9,12 +9,17 @@ Heya bearer token.
 ## Bridge
 
 The selected saved Heya origin receives the frozen
-`window.__HEYA_NATIVE_AUDIO__` protocol-v1 object. Every operation validates
+`window.__HEYA_NATIVE_AUDIO__` protocol-v2 object. Every operation validates
 the live main-frame origin again. Transport uses one narrowly permissioned
 Tauri command whose remote capability is generated for that exact origin and
 the main window only. It does not expose arbitrary Tauri commands. The ready
-event is `heya:native-audio:ready-v1`; normalized state and visualizer
+event is `heya:native-audio:ready-v2`; normalized state and visualizer
 snapshots are delivered through the bridge's subscription methods.
+
+Protocol v2 also requires `getAudioState()`. Heya samples that path as a
+liveness check while music is active. The response reads the Rust callback's
+PCM-frame atomics directly, so a dropped engine event or WebView event cannot
+leave the visible playhead frozen while audio continues.
 
 The exact public shape is documented in
 [`native-audio-bridge.d.ts`](native-audio-bridge.d.ts). Production loads accept
@@ -22,10 +27,10 @@ only a same-origin `/api/playback/native/media/` URL and the fixed opaque
 `X-Heya-Playback-Grant` credential. Redirects are rejected. Grants and URLs are
 redacted from Rust debug output and are never sent back to the page.
 
-## Processed mode
+## Audio pipeline
 
 The Rust engine uses two decoded PCM decks and a CPAL output stream. It supports
-gapless transitions, timed and smart crossfade, album-aware suppression,
+gapless transitions, timed and smart crossfade, mandatory album-continuity suppression,
 ReplayGain, pre/post gain, a 10-band EQ, headphone crossfeed, a limiter, and
 software volume. The EQ card's equalizer/crossfeed order is preserved. Shared
 output supports CPAL's integer and floating-point device formats, with browser
@@ -34,8 +39,9 @@ playback retained as the startup fallback.
 Smart crossfade consumes the same server-analyzed outro, natural-fade, and
 silence boundaries as WebAudio. A detected natural fade uses a linear outgoing
 curve; other transitions use equal-power curves, with MixRamp and the configured
-timed duration retained as fallbacks. Album-aware mode suppresses those overlaps
-between consecutive tracks from the same album. ReplayGain policy remains
+timed duration retained as fallbacks. Adjacent tracks from the same album and
+repeat-one loops are always gapless; this is a queue invariant rather than a
+user preference. ReplayGain policy remains
 Heya-owned: Heya resolves track versus album loudness and true-peak headroom,
 then passes the resulting per-track gain to both native decks. If loudness or
 boundary analysis arrives after loading, a narrow track-analysis command updates
@@ -43,7 +49,7 @@ the matching deck and re-arms its transition without restarting playback.
 
 HeyaClient enumerates CPAL output devices and exposes only normalized stable
 IDs, display labels, and the system-default flag through the audio bridge. A
-specific processed-mode output can be selected from Heya's Output tab; the
+specific output can be selected from Heya's Output tab; the
 choice is persisted in `app-settings.json`. Passing `null` selects “follow the
 system default.” An active native session is replaced at its current position
 when the output changes because a CPAL stream is bound to its device at open.
@@ -72,26 +78,10 @@ enters buffering, and waits for two seconds of decoded headroom (or confirmed
 end-of-file) before resuming. That hysteresis avoids rapid play/silence cycling
 on a marginal connection.
 
-## Bit-perfect mode
+## Output policy
 
-The first exclusive adapter is macOS CoreAudio. It acquires hog mode on the
-default device, switches to the source sample rate, opens an exact float output
-configuration, and releases hog mode when the session ends. It accepts known
-lossless sources up to 24-bit PCM and requires the decoded sample rate and
-channel count to match the exclusive output. A mismatch stops playback rather
-than resampling while claiming bit-perfect output.
-
-The initial macOS exclusive helper can acquire only the OS default CoreAudio
-device. Heya therefore locks output selection while bit-perfect is enabled. A
-specific device can still be used by making it the macOS system default first;
-arbitrary exclusive-device selection is separate future platform work.
-
-Bit-perfect mode forces gapless-only playback and bypasses ReplayGain, EQ,
-pre/post gain, crossfeed, limiter, software volume/mute, crossfade, resampling,
-and visualizer capture. Heya keeps processed settings saved and restores them
-when bit-perfect mode is turned off. If exclusive startup fails, the preference
-is restored to processed mode and playback safely resumes there.
-
-The local Cmd/Ctrl+, settings window and Heya's EQ card both control the same
-native preference. Linux and Windows currently advertise processed playback
-only; their exclusive adapters remain future platform work.
+Protocol v2 deliberately has one reliable shared-output pipeline. The former
+experimental bit-perfect/exclusive branch was removed: it rebuilt the renderer,
+changed system device state, disabled normal controls and DSP, and did not have
+enough platform coverage to justify a second lifecycle. Source and output
+formats remain visible in diagnostics, and resampling is reported explicitly.

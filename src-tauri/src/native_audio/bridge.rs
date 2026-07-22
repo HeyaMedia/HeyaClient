@@ -1,6 +1,6 @@
 use super::{
     validate_audio_load, validate_audio_track, AudioCapabilities, AudioCommandRequest,
-    AudioEventSink, AudioLoadRequest, AudioOutputMode, AudioPreloadRequest, NativeAudioManager,
+    AudioEventSink, AudioLoadRequest, AudioPreloadRequest, NativeAudioManager,
     NativeAudioStateEvent, NativeAudioVisualizerEvent, NATIVE_AUDIO_PROTOCOL_VERSION,
 };
 use crate::{
@@ -17,9 +17,9 @@ use std::sync::Arc;
 use tauri::{AppHandle, Manager, RunEvent, Runtime, Url, WebviewWindow};
 
 pub const AUDIO_BRIDGE_OBJECT_NAME: &str = "__HEYA_NATIVE_AUDIO__";
-pub const AUDIO_BRIDGE_READY_EVENT: &str = "heya:native-audio:ready-v1";
-pub const AUDIO_BRIDGE_STATE_EVENT: &str = "heya:native-audio:state-v1";
-pub const AUDIO_BRIDGE_VISUALIZER_EVENT: &str = "heya:native-audio:visualizer-v1";
+pub const AUDIO_BRIDGE_READY_EVENT: &str = "heya:native-audio:ready-v2";
+pub const AUDIO_BRIDGE_STATE_EVENT: &str = "heya:native-audio:state-v2";
+pub const AUDIO_BRIDGE_VISUALIZER_EVENT: &str = "heya:native-audio:visualizer-v2";
 pub fn audio_initialization_script() -> String {
     include_str!("bridge.js").replace(
         "__HEYA_NATIVE_AUDIO_COMMAND__",
@@ -58,12 +58,6 @@ pub fn audio_lifecycle_plugin<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct AudioOutputModeRequest {
-    mode: AudioOutputMode,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AudioOutputDeviceRequest {
     device_id: Option<String>,
 }
@@ -92,7 +86,7 @@ pub(crate) fn handle_audio_ipc<R: Runtime>(
         page_instance_id: request.page_instance_id,
     };
     let path = operation_path(&request.operation);
-    if path == Some("/v1/capabilities") {
+    if path == Some("/v2/capabilities") {
         log::info!("native audio bridge activated for {origin}");
     }
     let result = path
@@ -106,15 +100,15 @@ pub(crate) fn handle_audio_ipc<R: Runtime>(
 
 fn operation_path(operation: &str) -> Option<&'static str> {
     match operation {
-        "capabilities" => Some("/v1/capabilities"),
-        "output-mode" => Some("/v1/output-mode"),
-        "output-devices" => Some("/v1/output-devices"),
-        "output-device" => Some("/v1/output-device"),
-        "load" => Some("/v1/load"),
-        "preload" => Some("/v1/preload"),
-        "command" => Some("/v1/command"),
-        "dispose" => Some("/v1/dispose"),
-        "owner-disappeared" => Some("/v1/owner-disappeared"),
+        "capabilities" => Some("/v2/capabilities"),
+        "output-devices" => Some("/v2/output-devices"),
+        "output-device" => Some("/v2/output-device"),
+        "load" => Some("/v2/load"),
+        "state" => Some("/v2/state"),
+        "preload" => Some("/v2/preload"),
+        "command" => Some("/v2/command"),
+        "dispose" => Some("/v2/dispose"),
+        "owner-disappeared" => Some("/v2/owner-disappeared"),
         _ => None,
     }
 }
@@ -128,34 +122,12 @@ fn dispatch<R: Runtime>(
     let manager = app.state::<NativeAudioManager>();
     let settings = app.state::<AppState>().settings();
     match path {
-        "/v1/capabilities" => {
+        "/v2/capabilities" => {
             let mut capabilities = manager.capabilities();
-            if settings.bit_perfect_audio_enabled && capabilities.bit_perfect.available {
-                capabilities.preferred_output_mode = AudioOutputMode::BitPerfect;
-            }
             apply_audio_preference(&mut capabilities, settings.native_audio_enabled);
             encode(capabilities)
         }
-        "/v1/output-mode" => {
-            let request = serde_json::from_value::<AudioOutputModeRequest>(payload)
-                .map_err(|_| BridgeError::invalid_request("audio output mode is malformed"))?;
-            let capabilities = manager.capabilities();
-            if request.mode == AudioOutputMode::BitPerfect && !capabilities.bit_perfect.available {
-                return Err(BridgeError::new(
-                    BridgeErrorCode::BackendUnavailable,
-                    "bit-perfect output is unavailable on this platform",
-                ));
-            }
-            let mut updated = settings;
-            updated.bit_perfect_audio_enabled = request.mode == AudioOutputMode::BitPerfect;
-            app.state::<AppState>()
-                .save_settings(updated)
-                .map_err(|error| BridgeError::new(BridgeErrorCode::InternalError, error))?;
-            let mut response = capabilities;
-            response.preferred_output_mode = request.mode;
-            encode(response)
-        }
-        "/v1/output-devices" => {
+        "/v2/output-devices" => {
             let snapshot = manager.output_devices(settings.audio_output_device_id.as_deref())?;
             if settings.audio_output_device_id.is_some() && snapshot.follows_system_default {
                 let mut updated = settings;
@@ -166,7 +138,7 @@ fn dispatch<R: Runtime>(
             }
             encode(snapshot)
         }
-        "/v1/output-device" => {
+        "/v2/output-device" => {
             let request = serde_json::from_value::<AudioOutputDeviceRequest>(payload)
                 .map_err(|_| BridgeError::invalid_request("audio output device is malformed"))?;
             if let Some(device_id) = request.device_id.as_deref() {
@@ -179,7 +151,7 @@ fn dispatch<R: Runtime>(
                 .map_err(|error| BridgeError::new(BridgeErrorCode::InternalError, error))?;
             encode(manager.output_devices(updated.audio_output_device_id.as_deref())?)
         }
-        "/v1/load" => {
+        "/v2/load" => {
             if !settings.native_audio_enabled {
                 return Err(BridgeError::new(
                     BridgeErrorCode::BackendUnavailable,
@@ -188,12 +160,6 @@ fn dispatch<R: Runtime>(
             }
             let request = serde_json::from_value::<AudioLoadRequest>(payload)
                 .map_err(|_| BridgeError::invalid_request("audio load request is malformed"))?;
-            if request.mode == AudioOutputMode::BitPerfect && !settings.bit_perfect_audio_enabled {
-                return Err(BridgeError::new(
-                    BridgeErrorCode::BackendUnavailable,
-                    "bit-perfect music playback is not enabled in HeyaClient settings",
-                ));
-            }
             let load = validate_audio_load(&owner.origin, request)?;
             let preferred_device_id = match settings.audio_output_device_id.as_deref() {
                 Some(device_id) if manager.validate_output_device(device_id).is_ok() => {
@@ -214,7 +180,12 @@ fn dispatch<R: Runtime>(
             };
             encode(manager.start(owner, load, preferred_device_id.as_deref())?)
         }
-        "/v1/preload" => {
+        "/v2/state" => {
+            let request = serde_json::from_value::<DisposePlaybackRequest>(payload)
+                .map_err(|_| BridgeError::invalid_request("audio state request is malformed"))?;
+            encode(manager.state(&owner, &request.renderer_session_id)?)
+        }
+        "/v2/preload" => {
             let request = serde_json::from_value::<AudioPreloadRequest>(payload)
                 .map_err(|_| BridgeError::invalid_request("audio preload request is malformed"))?;
             let track = validate_audio_track(&owner.origin, request.track)?;
@@ -225,7 +196,7 @@ fn dispatch<R: Runtime>(
                 track,
             )?)
         }
-        "/v1/command" => {
+        "/v2/command" => {
             let command = serde_json::from_value::<AudioCommandRequest>(payload)
                 .map_err(|_| BridgeError::invalid_request("audio command is malformed"))?;
             let command_name = match &command.command {
@@ -245,7 +216,7 @@ fn dispatch<R: Runtime>(
             );
             encode(manager.send_command(&owner, command)?)
         }
-        "/v1/dispose" => {
+        "/v2/dispose" => {
             let dispose = serde_json::from_value::<DisposePlaybackRequest>(payload)
                 .map_err(|_| BridgeError::invalid_request("audio dispose request is malformed"))?;
             manager.dispose_owned(
@@ -255,7 +226,7 @@ fn dispatch<R: Runtime>(
             )?;
             Ok(Value::Null)
         }
-        "/v1/owner-disappeared" => {
+        "/v2/owner-disappeared" => {
             manager.dispose_owned(&owner, None, TerminationReason::Disposed)?;
             Ok(Value::Null)
         }
@@ -390,7 +361,7 @@ mod tests {
     use super::{
         apply_audio_preference, operation_path, validate_owner_origin, validate_window_origin,
     };
-    use crate::native_audio::{AudioCapabilities, BitPerfectCapabilities};
+    use crate::native_audio::AudioCapabilities;
     use crate::native_playback::{BridgeErrorCode, NATIVE_PLAYBACK_PROTOCOL_VERSION};
     use tauri::Url;
 
@@ -405,12 +376,6 @@ mod tests {
             equalizer: true,
             visualizer: true,
             output_device_selection: false,
-            preferred_output_mode: crate::native_audio::AudioOutputMode::Processed,
-            bit_perfect: BitPerfectCapabilities {
-                available: false,
-                requires_exclusive_device: true,
-                unavailable_reason: Some("test"),
-            },
             unavailable_reason: None,
         }
     }
@@ -441,11 +406,12 @@ mod tests {
 
     #[test]
     fn maps_only_the_public_audio_operations() {
-        assert_eq!(operation_path("capabilities"), Some("/v1/capabilities"));
-        assert_eq!(operation_path("output-devices"), Some("/v1/output-devices"));
-        assert_eq!(operation_path("command"), Some("/v1/command"));
+        assert_eq!(operation_path("capabilities"), Some("/v2/capabilities"));
+        assert_eq!(operation_path("output-devices"), Some("/v2/output-devices"));
+        assert_eq!(operation_path("state"), Some("/v2/state"));
+        assert_eq!(operation_path("command"), Some("/v2/command"));
         assert_eq!(operation_path("shell"), None);
-        assert_eq!(operation_path("/v1/command"), None);
+        assert_eq!(operation_path("/v2/command"), None);
     }
 
     #[test]

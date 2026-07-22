@@ -32,8 +32,6 @@ pub(crate) struct NativeAudioStatus {
     pub(crate) available: bool,
     pub(crate) gapless: bool,
     pub(crate) crossfade: bool,
-    pub(crate) bit_perfect_available: bool,
-    pub(crate) bit_perfect_unavailable_reason: Option<&'static str>,
 }
 
 #[tauri::command]
@@ -104,8 +102,6 @@ pub(crate) fn native_audio_status(audio: &native_audio::NativeAudioManager) -> N
         available: capabilities.available,
         gapless: capabilities.gapless,
         crossfade: capabilities.crossfade,
-        bit_perfect_available: capabilities.bit_perfect.available,
-        bit_perfect_unavailable_reason: capabilities.bit_perfect.unavailable_reason,
     }
 }
 

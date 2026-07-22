@@ -1804,7 +1804,6 @@ dependencies = [
  "block2",
  "cc",
  "chrono",
- "coreaudio-rs",
  "cpal",
  "crossbeam-channel",
  "libmpv2",

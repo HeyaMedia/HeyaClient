@@ -1,11 +1,11 @@
 (() => {
   'use strict'
 
-  const protocolVersion = 1
+  const protocolVersion = 2
   const commandName = '__HEYA_NATIVE_AUDIO_COMMAND__'
-  const readyEventName = 'heya:native-audio:ready-v1'
-  const stateEventName = 'heya:native-audio:state-v1'
-  const visualizerEventName = 'heya:native-audio:visualizer-v1'
+  const readyEventName = 'heya:native-audio:ready-v2'
+  const stateEventName = 'heya:native-audio:state-v2'
+  const visualizerEventName = 'heya:native-audio:visualizer-v2'
   const pageInstanceId = crypto.randomUUID()
   const stateListeners = new Set()
   const visualizerListeners = new Set()
@@ -54,10 +54,10 @@
   const bridge = Object.freeze({
     protocolVersion,
     getAudioCapabilities: () => request('capabilities', {}),
-    setAudioOutputMode: (mode) => request('output-mode', { mode }),
     getAudioOutputDevices: () => request('output-devices', {}),
     setAudioOutputDevice: (deviceId) => request('output-device', { deviceId }),
     loadAudio: (loadRequest) => request('load', loadRequest),
+    getAudioState: (stateRequest) => request('state', stateRequest),
     preloadNextAudio: (preloadRequest) => request('preload', preloadRequest),
     sendAudioCommand: (command) => request('command', command),
     subscribeAudioState: (listener) => subscribe(stateListeners, listener),

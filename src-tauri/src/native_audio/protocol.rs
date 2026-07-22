@@ -4,14 +4,7 @@ use crate::native_playback::{
 };
 use serde::{Deserialize, Serialize};
 
-pub const NATIVE_AUDIO_PROTOCOL_VERSION: u16 = 1;
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AudioOutputMode {
-    Processed,
-    BitPerfect,
-}
+pub const NATIVE_AUDIO_PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -50,7 +43,6 @@ pub struct AudioProcessingSettings {
     pub dsp_order: [DspBlockId; 2],
     pub crossfade_mode: CrossfadeMode,
     pub crossfade_seconds: f32,
-    pub album_aware: bool,
     pub visualizer_enabled: bool,
 }
 
@@ -68,7 +60,6 @@ impl Default for AudioProcessingSettings {
             dsp_order: [DspBlockId::Equalizer, DspBlockId::Crossfeed],
             crossfade_mode: CrossfadeMode::Gapless,
             crossfade_seconds: 3.0,
-            album_aware: true,
             visualizer_enabled: false,
         }
     }
@@ -104,24 +95,6 @@ impl AudioProcessingSettings {
         }
         Ok(())
     }
-
-    pub fn bit_perfect() -> Self {
-        Self {
-            replay_gain_enabled: false,
-            eq_enabled: false,
-            eq_bands_db: [0.0; 10],
-            preamp_db: 0.0,
-            postgain_db: 0.0,
-            limiter_enabled: false,
-            crossfeed_enabled: false,
-            crossfeed_preset: CrossfeedPreset::Natural,
-            dsp_order: [DspBlockId::Equalizer, DspBlockId::Crossfeed],
-            crossfade_mode: CrossfadeMode::Gapless,
-            crossfade_seconds: 0.0,
-            album_aware: true,
-            visualizer_enabled: false,
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -133,16 +106,6 @@ pub struct AudioTrackLoadRequest {
     pub album_key: String,
     #[serde(default)]
     pub format_hint: Option<String>,
-    #[serde(default)]
-    pub codec: Option<String>,
-    #[serde(default)]
-    pub sample_rate_hz: Option<u32>,
-    #[serde(default)]
-    pub bit_depth: Option<u16>,
-    #[serde(default)]
-    pub channels: Option<u16>,
-    #[serde(default)]
-    pub lossless: bool,
     #[serde(default)]
     pub gain_db: Option<f32>,
     #[serde(default)]
@@ -165,7 +128,6 @@ pub struct AudioTrackLoadRequest {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AudioLoadRequest {
-    pub mode: AudioOutputMode,
     #[serde(default)]
     pub processing: AudioProcessingSettings,
     pub track: AudioTrackLoadRequest,
@@ -275,15 +237,6 @@ pub struct AudioCommandRequest {
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct BitPerfectCapabilities {
-    pub available: bool,
-    pub requires_exclusive_device: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub unavailable_reason: Option<&'static str>,
-}
-
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
 pub struct AudioCapabilities {
     pub protocol_version: u16,
     pub backend: &'static str,
@@ -294,8 +247,6 @@ pub struct AudioCapabilities {
     pub equalizer: bool,
     pub visualizer: bool,
     pub output_device_selection: bool,
-    pub preferred_output_mode: AudioOutputMode,
-    pub bit_perfect: BitPerfectCapabilities,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<BridgeErrorCode>,
 }
@@ -320,7 +271,6 @@ pub struct NativeAudioOutputDevices {
 #[serde(rename_all = "camelCase")]
 pub struct AudioLoadResult {
     pub renderer_session_id: RendererSessionId,
-    pub active_mode: AudioOutputMode,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -338,8 +288,6 @@ pub struct NativeAudioState {
     pub current_track_id: Option<i64>,
     pub started_track_id: Option<i64>,
     pub ended_track_id: Option<i64>,
-    pub output_mode: AudioOutputMode,
-    pub bit_perfect_active: bool,
     pub source_sample_rate_hz: Option<u32>,
     pub source_channels: Option<u16>,
     pub output_sample_rate_hz: Option<u32>,
@@ -369,8 +317,6 @@ impl Default for NativeAudioState {
             current_track_id: None,
             started_track_id: None,
             ended_track_id: None,
-            output_mode: AudioOutputMode::Processed,
-            bit_perfect_active: false,
             source_sample_rate_hz: None,
             source_channels: None,
             output_sample_rate_hz: None,

@@ -1,6 +1,5 @@
-/** HeyaClient native audio bridge protocol v1. */
+/** HeyaClient native audio bridge protocol v2. */
 
-export type NativeAudioOutputMode = 'processed' | 'bit_perfect'
 export type NativeAudioCrossfadeMode = 'gapless' | 'crossfade' | 'smart'
 export type NativeAudioCrossfeedPreset = 'subtle' | 'natural' | 'strong'
 export type NativeAudioTerminationReason =
@@ -23,12 +22,11 @@ export interface NativeAudioProcessingSettings {
   dspOrder: Array<'equalizer' | 'crossfeed'>
   crossfadeMode: NativeAudioCrossfadeMode
   crossfadeSeconds: number
-  albumAware: boolean
   visualizerEnabled: boolean
 }
 
 export interface NativeAudioCapabilities {
-  protocolVersion: 1
+  protocolVersion: 2
   backend: 'heya-rust-audio'
   available: boolean
   gapless: boolean
@@ -37,12 +35,6 @@ export interface NativeAudioCapabilities {
   equalizer: boolean
   visualizer: boolean
   outputDeviceSelection: boolean
-  preferredOutputMode: NativeAudioOutputMode
-  bitPerfect: {
-    available: boolean
-    requiresExclusiveDevice: boolean
-    unavailableReason?: string
-  }
   unavailableReason?: string
 }
 
@@ -63,11 +55,6 @@ export interface NativeAudioTrackRequest {
   durationSeconds: number
   albumKey: string
   formatHint?: string
-  codec?: string
-  sampleRateHz?: number
-  bitDepth?: number
-  channels?: number
-  lossless?: boolean
   gainDb?: number
   skipCrossfade?: boolean
   /** Plex MixRamp prolog metadata: "db seconds;db seconds;...". */
@@ -98,8 +85,6 @@ export interface NativeAudioState {
   currentTrackId: number | null
   startedTrackId: number | null
   endedTrackId: number | null
-  outputMode: NativeAudioOutputMode
-  bitPerfectActive: boolean
   sourceSampleRateHz: number | null
   sourceChannels: number | null
   outputSampleRateHz: number | null
@@ -144,16 +129,20 @@ export interface NativeAudioCommandResult {
 }
 
 export interface HeyaNativeAudioBridge {
-  readonly protocolVersion: 1
+  readonly protocolVersion: 2
   getAudioCapabilities(): Promise<NativeAudioCapabilities>
-  setAudioOutputMode(mode: NativeAudioOutputMode): Promise<NativeAudioCapabilities>
   getAudioOutputDevices(): Promise<NativeAudioOutputDevices>
   setAudioOutputDevice(deviceId: string | null): Promise<NativeAudioOutputDevices>
   loadAudio(request: {
-    mode: NativeAudioOutputMode
     processing: NativeAudioProcessingSettings
     track: NativeAudioTrackRequest
-  }): Promise<{ rendererSessionId: string; activeMode: NativeAudioOutputMode }>
+  }): Promise<{ rendererSessionId: string }>
+  getAudioState(request: { rendererSessionId: string }): Promise<{
+    protocolVersion: 2
+    rendererSessionId: string
+    stateRevision: number
+    payload: NativeAudioState
+  }>
   preloadNextAudio(request: {
     rendererSessionId: string
     commandId: string
@@ -161,13 +150,13 @@ export interface HeyaNativeAudioBridge {
   }): Promise<NativeAudioCommandResult>
   sendAudioCommand(command: NativeAudioCommand): Promise<NativeAudioCommandResult>
   subscribeAudioState(listener: (event: {
-    protocolVersion: 1
+    protocolVersion: 2
     rendererSessionId: string
     stateRevision: number
     payload: NativeAudioState
   }) => void): () => void
   subscribeAudioVisualizer(listener: (event: {
-    protocolVersion: 1
+    protocolVersion: 2
     rendererSessionId: string
     visualizerRevision: number
     samples: number[]

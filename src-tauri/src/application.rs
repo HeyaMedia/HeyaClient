@@ -71,8 +71,6 @@ struct ApplicationNativeAudioStatus {
     available: bool,
     gapless: bool,
     crossfade: bool,
-    bit_perfect_available: bool,
-    bit_perfect_unavailable_reason: Option<&'static str>,
 }
 
 impl From<crate::NativeAudioStatus> for ApplicationNativeAudioStatus {
@@ -82,8 +80,6 @@ impl From<crate::NativeAudioStatus> for ApplicationNativeAudioStatus {
             available: status.available,
             gapless: status.gapless,
             crossfade: status.crossfade,
-            bit_perfect_available: status.bit_perfect_available,
-            bit_perfect_unavailable_reason: status.bit_perfect_unavailable_reason,
         }
     }
 }
@@ -116,7 +112,6 @@ struct ApplicationSettings {
     reconnect_on_launch: bool,
     native_playback_enabled: bool,
     native_audio_enabled: bool,
-    bit_perfect_audio_enabled: bool,
     audio_output_device_id: Option<String>,
     track_change_notifications: bool,
 }
@@ -127,7 +122,6 @@ impl From<AppSettings> for ApplicationSettings {
             reconnect_on_launch: settings.reconnect_on_launch,
             native_playback_enabled: settings.native_playback_enabled,
             native_audio_enabled: settings.native_audio_enabled,
-            bit_perfect_audio_enabled: settings.bit_perfect_audio_enabled,
             audio_output_device_id: settings.audio_output_device_id,
             track_change_notifications: settings.track_change_notifications,
         }
@@ -140,7 +134,6 @@ impl From<ApplicationSettings> for AppSettings {
             reconnect_on_launch: settings.reconnect_on_launch,
             native_playback_enabled: settings.native_playback_enabled,
             native_audio_enabled: settings.native_audio_enabled,
-            bit_perfect_audio_enabled: settings.bit_perfect_audio_enabled,
             audio_output_device_id: settings.audio_output_device_id,
             track_change_notifications: settings.track_change_notifications,
         }

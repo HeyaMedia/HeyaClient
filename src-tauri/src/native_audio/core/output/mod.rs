@@ -17,8 +17,6 @@ const CONVERSION_SCRATCH_SAMPLES: usize = 64 * 1024;
 /// Holds the cpal output stream and related state.
 pub struct CpalOutput {
     stream: Option<Stream>,
-    #[cfg(target_os = "macos")]
-    _exclusive: Option<MacExclusiveOutput>,
     pub sample_rate: u32,
     pub channels: u16,
     pub device_id: String,
@@ -39,66 +37,6 @@ pub struct AudioOutputDevicesSnapshot {
     pub follows_system_default: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OutputRequest {
-    Shared,
-    Exclusive { sample_rate: u32, channels: u16 },
-}
-
-#[cfg(target_os = "macos")]
-struct MacExclusiveOutput {
-    device_id: u32,
-    acquired_hog: bool,
-}
-
-#[cfg(target_os = "macos")]
-impl MacExclusiveOutput {
-    fn acquire(sample_rate: u32) -> Result<Self, String> {
-        use coreaudio::audio_unit::macos_helpers::{
-            get_default_device_id, get_hogging_pid, set_device_sample_rate, toggle_hog_mode,
-        };
-
-        let device_id = get_default_device_id(false).ok_or("no default CoreAudio output device")?;
-        let current_pid = std::process::id() as i32;
-        let owner = get_hogging_pid(device_id)
-            .map_err(|error| format!("could not inspect CoreAudio exclusive mode: {error}"))?;
-        let acquired_hog = if owner == -1 {
-            let owner = toggle_hog_mode(device_id)
-                .map_err(|error| format!("could not acquire CoreAudio exclusive mode: {error}"))?;
-            if owner != current_pid {
-                return Err("the default audio device refused exclusive access".into());
-            }
-            true
-        } else if owner == current_pid {
-            false
-        } else {
-            return Err("the default audio device is in exclusive use by another process".into());
-        };
-
-        if let Err(error) = set_device_sample_rate(device_id, sample_rate as f64) {
-            if acquired_hog {
-                let _ = toggle_hog_mode(device_id);
-            }
-            return Err(format!(
-                "the default audio device does not support {sample_rate} Hz exclusive output: {error}"
-            ));
-        }
-        Ok(Self {
-            device_id,
-            acquired_hog,
-        })
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl Drop for MacExclusiveOutput {
-    fn drop(&mut self) {
-        if self.acquired_hog {
-            let _ = coreaudio::audio_unit::macos_helpers::toggle_hog_mode(self.device_id);
-        }
-    }
-}
-
 // SAFETY: CpalOutput is only accessed from a single thread (the thread that
 // creates it). The cpal Stream contains raw pointers which prevent auto-Send,
 // but we ensure it's never sent across threads after creation.
@@ -111,7 +49,6 @@ impl CpalOutput {
     /// audio state directly. Zero mutexes on the audio path.
     pub fn open(
         mut cb_state: AudioCallbackState,
-        request: OutputRequest,
         preferred_device_id: Option<&str>,
         event_tx: Sender<EngineEvent>,
     ) -> Result<Self, String> {
@@ -125,62 +62,14 @@ impl CpalOutput {
             .description()
             .map(|description| description.name().to_string())
             .unwrap_or_else(|_| device.to_string());
-        #[cfg(target_os = "macos")]
-        let is_default_device = host
-            .default_output_device()
-            .and_then(|device| device.id().ok())
-            .is_some_and(|id| id.to_string() == device_id);
-
-        #[cfg(target_os = "macos")]
-        let exclusive = match request {
-            OutputRequest::Exclusive { sample_rate, .. } => {
-                if !is_default_device {
-                    return Err(
-                        "bit-perfect output currently requires the selected device to be the system default"
-                            .into(),
-                    );
-                }
-                Some(MacExclusiveOutput::acquire(sample_rate)?)
-            }
-            OutputRequest::Shared => None,
-        };
-        #[cfg(not(target_os = "macos"))]
-        if matches!(request, OutputRequest::Exclusive { .. }) {
-            return Err("exclusive source-rate output is not implemented on this platform".into());
-        }
-
-        let (sample_rate, channels, sample_format) = match request {
-            OutputRequest::Shared => {
-                let config = device
-                    .default_output_config()
-                    .map_err(|e| format!("default output config: {e}"))?;
-                (
-                    config.sample_rate(),
-                    config.channels(),
-                    config.sample_format(),
-                )
-            }
-            OutputRequest::Exclusive {
-                sample_rate,
-                channels,
-            } => {
-                let exact = device
-                    .supported_output_configs()
-                    .map_err(|error| format!("could not inspect output formats: {error}"))?
-                    .any(|range| {
-                        range.sample_format() == SampleFormat::F32
-                            && range.channels() == channels
-                            && range.min_sample_rate() <= sample_rate
-                            && sample_rate <= range.max_sample_rate()
-                    });
-                if !exact {
-                    return Err(format!(
-                        "the selected audio device has no exact {sample_rate} Hz/{channels}-channel float output"
-                    ));
-                }
-                (sample_rate, channels, SampleFormat::F32)
-            }
-        };
+        let config = device
+            .default_output_config()
+            .map_err(|e| format!("default output config: {e}"))?;
+        let (sample_rate, channels, sample_format) = (
+            config.sample_rate(),
+            config.channels(),
+            config.sample_format(),
+        );
 
         debug!(
             device = %device_name,
@@ -248,8 +137,6 @@ impl CpalOutput {
 
         Ok(Self {
             stream: Some(stream),
-            #[cfg(target_os = "macos")]
-            _exclusive: exclusive,
             sample_rate,
             channels,
             device_id,
@@ -258,8 +145,7 @@ impl CpalOutput {
     }
 
     /// Stop the OS render callback without tearing the stream down. The
-    /// device stays claimed (exclusive mode keeps its hog), so `resume`
-    /// is glitch-free and cheap.
+    /// the stream can resume without rebuilding the decoder or callback.
     pub fn pause(&self) -> Result<(), String> {
         match &self.stream {
             Some(stream) => stream

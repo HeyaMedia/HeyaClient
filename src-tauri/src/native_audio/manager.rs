@@ -4,13 +4,13 @@ use super::{
         command::Command as EngineCommand,
         event::EngineEvent,
         output::{enumerate_output_devices, validate_output_device},
-        AudioEngine,
+        types::EngineState,
+        AudioEngine, AudioEngineClock,
     },
     AudioCapabilities, AudioCommand, AudioCommandRequest, AudioCommandResult, AudioLoadResult,
-    AudioOutputMode, AudioProcessingSettings, CrossfadeMode, CrossfeedPreset, DspBlockId,
-    NativeAudioOutputDevice, NativeAudioOutputDevices, NativeAudioState, NativeAudioStateEvent,
-    NativeAudioVisualizerEvent, ValidatedAudioLoad, ValidatedAudioTrack,
-    NATIVE_AUDIO_PROTOCOL_VERSION,
+    AudioProcessingSettings, CrossfadeMode, CrossfeedPreset, DspBlockId, NativeAudioOutputDevice,
+    NativeAudioOutputDevices, NativeAudioState, NativeAudioStateEvent, NativeAudioVisualizerEvent,
+    ValidatedAudioLoad, ValidatedAudioTrack, NATIVE_AUDIO_PROTOCOL_VERSION,
 };
 use crate::native_playback::{
     BridgeError, BridgeErrorCode, CommandId, PlaybackError, RendererSessionId, TerminationReason,
@@ -113,14 +113,6 @@ impl NativeAudioManager {
             equalizer: true,
             visualizer: true,
             output_device_selection: true,
-            preferred_output_mode: AudioOutputMode::Processed,
-            bit_perfect: super::BitPerfectCapabilities {
-                available: cfg!(target_os = "macos"),
-                requires_exclusive_device: true,
-                unavailable_reason: (!cfg!(target_os = "macos")).then_some(
-                    "The exclusive, source-rate output adapter is not available on this platform yet.",
-                ),
-            },
             unavailable_reason: None,
         }
     }
@@ -158,6 +150,24 @@ impl NativeAudioManager {
             .and_then(|state| state.active.as_ref().map(|active| active.snapshot.clone()))
     }
 
+    pub fn state(
+        &self,
+        owner: &WebPlaybackOwner,
+        renderer_session_id: &RendererSessionId,
+    ) -> Result<NativeAudioStateEvent, BridgeError> {
+        let mut manager = self.shared.state.lock().map_err(|_| internal_error())?;
+        let active = manager.active.as_mut().ok_or_else(unknown_session)?;
+        ensure_owner(active, owner, renderer_session_id)?;
+        sync_state_from_engine_clock(&mut active.state, active.engine.clock_snapshot());
+        active.snapshot.state_revision = active.snapshot.state_revision.saturating_add(1);
+        Ok(NativeAudioStateEvent {
+            protocol_version: NATIVE_AUDIO_PROTOCOL_VERSION,
+            renderer_session_id: renderer_session_id.clone(),
+            state_revision: active.snapshot.state_revision,
+            payload: active.state.clone(),
+        })
+    }
+
     pub fn start(
         &self,
         owner: WebPlaybackOwner,
@@ -171,38 +181,8 @@ impl NativeAudioManager {
             .map_err(|_| internal_error())?;
         self.dispose_locked(TerminationReason::Disposed)?;
 
-        let engine = match load.mode {
-            AudioOutputMode::Processed => AudioEngine::start(preferred_device_id),
-            AudioOutputMode::BitPerfect => {
-                if load.processing != AudioProcessingSettings::bit_perfect() {
-                    return Err(BridgeError::invalid_request(
-                        "bit-perfect playback requires every DSP feature to be disabled",
-                    ));
-                }
-                if !load.track.lossless {
-                    return Err(BridgeError::invalid_request(
-                        "bit-perfect playback requires a lossless source",
-                    ));
-                }
-                let sample_rate = load.track.sample_rate_hz.ok_or_else(|| {
-                    BridgeError::invalid_request(
-                        "bit-perfect playback requires a known source sample rate",
-                    )
-                })?;
-                let channels = load.track.channels.ok_or_else(|| {
-                    BridgeError::invalid_request(
-                        "bit-perfect playback requires a known source channel count",
-                    )
-                })?;
-                if !matches!(load.track.bit_depth, Some(1..=24)) {
-                    return Err(BridgeError::invalid_request(
-                        "bit-perfect playback currently supports PCM depths up to 24-bit",
-                    ));
-                }
-                AudioEngine::start_exclusive(sample_rate, channels, preferred_device_id)
-            }
-        }
-        .map_err(|message| BridgeError::new(BridgeErrorCode::BackendUnavailable, message))?;
+        let engine = AudioEngine::start(preferred_device_id)
+            .map_err(|message| BridgeError::new(BridgeErrorCode::BackendUnavailable, message))?;
         let events = engine.events();
         let renderer_session_id = RendererSessionId::generate();
         log::info!(
@@ -212,9 +192,8 @@ impl NativeAudioManager {
             load.track.start_position_seconds.unwrap_or(0.0),
         );
         let start_position_seconds = load.track.start_position_seconds.unwrap_or(0.0);
-        let mut state = NativeAudioState {
+        let state = NativeAudioState {
             loading: true,
-            output_mode: load.mode,
             current_track_id: Some(load.track.meta.rating_key),
             position_seconds: start_position_seconds,
             duration_seconds: load.track.meta.duration_ms as f64 / 1000.0,
@@ -225,8 +204,6 @@ impl NativeAudioManager {
             dsp_active: processing_is_active(&load.processing),
             ..NativeAudioState::default()
         };
-        state.bit_perfect_active = load.mode == AudioOutputMode::BitPerfect;
-
         configure_processing(&engine, &load.processing).map_err(command_error)?;
         engine
             .send(EngineCommand::Play {
@@ -266,7 +243,6 @@ impl NativeAudioManager {
 
         Ok(AudioLoadResult {
             renderer_session_id,
-            active_mode: load.mode,
         })
     }
 
@@ -278,16 +254,6 @@ impl NativeAudioManager {
         track: ValidatedAudioTrack,
     ) -> Result<AudioCommandResult, BridgeError> {
         self.execute(owner, renderer_session_id, command_id, |active| {
-            if active.state.output_mode == AudioOutputMode::BitPerfect
-                && (track.sample_rate_hz != active.state.output_sample_rate_hz
-                    || !track.lossless
-                    || !matches!(track.bit_depth, Some(1..=24)))
-            {
-                return Err(
-                    "the next track needs a new exclusive output format and cannot be preloaded"
-                        .into(),
-                );
-            }
             active.engine.send(EngineCommand::PreloadNext {
                 source: track.source,
                 meta: track.meta,
@@ -438,9 +404,6 @@ fn apply_command(active: &mut ActiveSession, command: AudioCommand) -> Result<()
             })
         }
         AudioCommand::SetVolume { volume } => {
-            if active.state.output_mode == AudioOutputMode::BitPerfect && volume != 1.0 {
-                return Err("software volume is disabled during bit-perfect playback".into());
-            }
             active.unmuted_volume = volume;
             active.state.volume = volume;
             let gain = if active.state.muted {
@@ -451,9 +414,6 @@ fn apply_command(active: &mut ActiveSession, command: AudioCommand) -> Result<()
             active.engine.send(EngineCommand::SetVolume { gain })
         }
         AudioCommand::SetMuted { muted } => {
-            if active.state.output_mode == AudioOutputMode::BitPerfect && muted {
-                return Err("software mute is disabled during bit-perfect playback".into());
-            }
             active.state.muted = muted;
             active.engine.send(EngineCommand::SetVolume {
                 gain: if muted {
@@ -464,11 +424,6 @@ fn apply_command(active: &mut ActiveSession, command: AudioCommand) -> Result<()
             })
         }
         AudioCommand::UpdateProcessing { settings } => {
-            if active.state.output_mode == AudioOutputMode::BitPerfect
-                && settings != AudioProcessingSettings::bit_perfect()
-            {
-                return Err("DSP cannot be enabled during bit-perfect playback".into());
-            }
             configure_processing(&active.engine, &settings)?;
             active.state.dsp_active = processing_is_active(&settings);
             active.processing = settings;
@@ -535,9 +490,10 @@ fn configure_processing(
     };
     engine.send(EngineCommand::SetCrossfadeWindow { ms: crossfade_ms })?;
     engine.send(EngineCommand::SetSameAlbumCrossfade {
-        // The public setting enables album-aware suppression. The core setting
-        // has the inverse meaning: whether same-album tracks may crossfade.
-        enabled: !settings.album_aware,
+        // Album continuity is an invariant. Heya additionally marks exact
+        // adjacent/repeat transitions with skip_crossfade, while this guards
+        // same-release transitions if queue sequence metadata is incomplete.
+        enabled: false,
     })?;
     engine.send(EngineCommand::SetSmartCrossfade {
         enabled: settings.crossfade_mode == CrossfadeMode::Smart,
@@ -783,26 +739,46 @@ fn apply_track_format(active: &mut ActiveSession, format: TrackFormat) {
     active.state.output_sample_rate_hz = Some(format.output_sample_rate);
     active.state.output_channels = Some(format.output_channels);
     active.state.resampler_active = format.source_sample_rate != format.output_sample_rate;
-    if active.state.output_mode == AudioOutputMode::BitPerfect
-        && (format.source_sample_rate != format.output_sample_rate
-            || format.source_channels != format.output_channels)
-    {
-        // Metadata selected the exclusive device format before decoding began.
-        // If decoding proves it wrong, stop rather than resampling/upmixing while
-        // claiming a bit-perfect path. Cached preload formats are rechecked when
-        // that track becomes active.
-        let _ = active.engine.send(EngineCommand::Stop);
-        active.state.bit_perfect_active = false;
-        active.state.playing = false;
-        active.state.paused = true;
-        active.state.loading = false;
-        active.state.buffering = false;
-        active.state.error = Some(PlaybackError {
-            code: BridgeErrorCode::CommandFailed,
-            message: "decoded source format did not match the requested exclusive output format"
-                .into(),
-        });
-        active.state.termination_reason = Some(TerminationReason::Failed);
+}
+
+fn sync_state_from_engine_clock(state: &mut NativeAudioState, clock: AudioEngineClock) {
+    // Preserve the requested resume point until the callback has accepted the
+    // initial deck/seek. A zeroed stopped clock during load is not newer truth.
+    if !state.loading || clock.state != EngineState::Stopped || clock.position_seconds > 0.0 {
+        state.position_seconds = clock.position_seconds;
+    }
+    if clock.duration_seconds > 0.0 {
+        state.duration_seconds = clock.duration_seconds;
+    }
+    if let Some(track_id) = clock.active_track_id {
+        state.current_track_id = Some(track_id);
+    }
+
+    match clock.state {
+        EngineState::Playing => {
+            state.playing = true;
+            state.paused = false;
+            state.loading = false;
+            state.buffering = false;
+        }
+        EngineState::Paused => {
+            state.playing = false;
+            state.paused = true;
+            state.loading = false;
+            state.buffering = false;
+        }
+        EngineState::Buffering => {
+            state.playing = false;
+            state.paused = false;
+            state.loading = false;
+            state.buffering = true;
+        }
+        EngineState::Stopped if !state.loading => {
+            state.playing = false;
+            state.paused = true;
+            state.buffering = false;
+        }
+        EngineState::Stopped => {}
     }
 }
 
@@ -881,23 +857,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capabilities_do_not_claim_unimplemented_exclusive_output() {
+    fn capabilities_expose_the_supported_native_audio_path() {
         let manager = NativeAudioManager::new(Arc::new(LogAudioEventSink));
         let capabilities = manager.capabilities();
 
         assert!(capabilities.available);
         assert!(capabilities.output_device_selection);
-        assert_eq!(
-            capabilities.preferred_output_mode,
-            AudioOutputMode::Processed
+        assert!(capabilities.gapless);
+        assert!(capabilities.crossfade);
+    }
+
+    #[test]
+    fn direct_engine_clock_repairs_a_stale_event_snapshot() {
+        let mut state = NativeAudioState {
+            playing: true,
+            paused: false,
+            position_seconds: 0.0,
+            duration_seconds: 146.0,
+            current_track_id: Some(7),
+            ..NativeAudioState::default()
+        };
+
+        sync_state_from_engine_clock(
+            &mut state,
+            AudioEngineClock {
+                state: EngineState::Playing,
+                position_seconds: 31.25,
+                duration_seconds: 146.0,
+                active_track_id: Some(7),
+            },
         );
-        assert_eq!(
-            capabilities.bit_perfect.available,
-            cfg!(target_os = "macos")
-        );
-        assert_eq!(
-            capabilities.bit_perfect.unavailable_reason.is_some(),
-            !cfg!(target_os = "macos")
-        );
+
+        assert_eq!(state.position_seconds, 31.25);
+        assert!(state.playing);
+        assert!(!state.paused);
     }
 }

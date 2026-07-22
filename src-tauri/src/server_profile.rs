@@ -32,8 +32,6 @@ pub struct AppSettings {
     pub native_playback_enabled: bool,
     #[serde(default = "default_native_audio_enabled")]
     pub native_audio_enabled: bool,
-    #[serde(default)]
-    pub bit_perfect_audio_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audio_output_device_id: Option<String>,
     #[serde(default)]
@@ -46,7 +44,6 @@ impl Default for AppSettings {
             reconnect_on_launch: default_reconnect_on_launch(),
             native_playback_enabled: default_native_playback_enabled(),
             native_audio_enabled: default_native_audio_enabled(),
-            bit_perfect_audio_enabled: false,
             audio_output_device_id: None,
             track_change_notifications: false,
         }
@@ -396,7 +393,6 @@ mod tests {
         assert!(settings.reconnect_on_launch);
         assert!(settings.native_playback_enabled);
         assert!(settings.native_audio_enabled);
-        assert!(!settings.bit_perfect_audio_enabled);
         assert_eq!(settings.audio_output_device_id, None);
         assert!(!settings.track_change_notifications);
         assert_eq!(settings, AppSettings::default());
