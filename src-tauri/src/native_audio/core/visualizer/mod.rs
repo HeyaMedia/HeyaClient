@@ -2,11 +2,13 @@
 //!
 //! The audio callback sends raw PCM chunks via a lock-free channel.
 //! The visualizer task accumulates them into a rolling buffer, computes
-//! FFT at ~60fps, and emits VisFrame events to JS.
+//! FFT at ~30fps, and emits VisFrame events to JS.
 
 pub mod fft;
 
 use self::fft::{downmix_to_mono, FftAnalyzer, FFT_SIZE};
+
+const TIME_DOMAIN_SAMPLES: usize = 512;
 
 /// Processes audio samples for visualizer output.
 ///
@@ -63,12 +65,30 @@ impl VisualizerProcessor {
         let start = mono.len().saturating_sub(FFT_SIZE);
         let window = &mono[start..start + FFT_SIZE.min(mono.len() - start)];
 
-        // Time-domain samples (for JS waveform/oscilloscope display)
-        let time_domain = window.to_vec();
+        // Scope/VU rendering does not need the full FFT window. Keeping only
+        // the newest 512 samples cuts the largest per-frame WebView payload by
+        // 75% without changing the frequency-bin resolution.
+        let time_domain = window[window.len().saturating_sub(TIME_DOMAIN_SAMPLES)..].to_vec();
 
         // Frequency-domain bins (dB)
         let bins = self.analyzer.compute(window);
 
         Some((time_domain, bins))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn emits_compact_time_domain_with_full_frequency_resolution() {
+        let mut processor = VisualizerProcessor::new(2);
+        processor.push_samples(&vec![0.25; FFT_SIZE * 2]);
+
+        let (time_domain, frequency_bins) = processor.compute().expect("visualizer frame");
+
+        assert_eq!(time_domain.len(), TIME_DOMAIN_SAMPLES);
+        assert_eq!(frequency_bins.len(), fft::NUM_BINS);
     }
 }

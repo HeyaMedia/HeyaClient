@@ -17,9 +17,11 @@ event is `heya:native-audio:ready-v2`; normalized state and visualizer
 snapshots are delivered through the bridge's subscription methods.
 
 Protocol v2 also requires `getAudioState()`. Heya samples that path as a
-liveness check while music is active. The response reads the Rust callback's
-PCM-frame atomics directly, so a dropped engine event or WebView event cannot
-leave the visible playhead frozen while audio continues.
+liveness check while music is active and projects the clock between samples.
+The response reads the Rust callback's PCM-frame atomics directly, so a
+dropped engine event or WebView event cannot leave the visible playhead frozen
+while audio continues. Push events are reserved for lifecycle changes rather
+than relaying a redundant position snapshot four times per second.
 
 The exact public shape is documented in
 [`native-audio-bridge.d.ts`](native-audio-bridge.d.ts). Production loads accept
@@ -59,10 +61,11 @@ output IDs. They contain only EQ, pre/post gain, and crossfeed. A device with
 no saved profile receives Flat EQ with crossfeed disabled; ReplayGain,
 crossfade, limiter, and DSP ordering remain global playback settings.
 
-Post-DSP PCM and FFT snapshots drive Heya's mini meter, spectrum, scope, VU,
-and starfield. The server-analyzed waveform remains backend-neutral. Milkdrop
-falls back to Spectrum under native playback because butterchurn requires a
-real WebAudio `AnalyserNode` rather than copied PCM samples.
+Post-DSP PCM and FFT snapshots at 30 Hz drive Heya's live spectrum, scope, VU,
+and starfield views. Static icons do not enable the analyser bridge. The
+server-analyzed waveform remains backend-neutral. Milkdrop
+uses butterchurn's explicit audio-level input under native playback rather
+than connecting a WebAudio `AnalyserNode`.
 
 ### Buffering and real-time safety
 

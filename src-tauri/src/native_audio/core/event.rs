@@ -6,10 +6,6 @@ use serde::Serialize;
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum EngineEvent {
-    Position {
-        position_ms: u64,
-        duration_ms: u64,
-    },
     State {
         state: String,
     },
@@ -39,7 +35,7 @@ pub enum EngineEvent {
         message: String,
     },
     VisFrame {
-        /// Time-domain samples (interleaved f32, but sent as Vec<f32> for serde).
+        /// Compact mono time-domain samples for scope/VU rendering.
         samples: Vec<f32>,
         /// FFT frequency bins in dB.
         frequency_bins: Vec<f32>,

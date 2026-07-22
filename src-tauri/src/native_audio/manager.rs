@@ -590,22 +590,6 @@ fn handle_engine_event(
         active.state.started_track_id = None;
         active.state.ended_track_id = None;
         match event {
-            EngineEvent::Position {
-                position_ms,
-                duration_ms,
-            } => {
-                let next_position = position_ms as f64 / 1000.0;
-                if (next_position - active.state.position_seconds).abs() >= 2.0 {
-                    log::info!(
-                        "native audio position jumped renderer={} from_seconds={:.3} to_seconds={:.3}",
-                        renderer_session_id.as_str(),
-                        active.state.position_seconds,
-                        next_position,
-                    );
-                }
-                active.state.position_seconds = next_position;
-                active.state.duration_seconds = duration_ms as f64 / 1000.0;
-            }
             EngineEvent::State { state } => {
                 log::info!(
                     "native audio state renderer={} state={state}",
@@ -793,6 +777,11 @@ fn publish_state(shared: &Shared, renderer_session_id: &RendererSessionId) {
         if &active.snapshot.renderer_session_id != renderer_session_id {
             return;
         }
+        // Lifecycle events remain push-based, but their clock fields come
+        // straight from the callback atomics. Continuous position is pulled
+        // by protocol v2 and projected in Heya, so no 4 Hz event relay is
+        // needed merely to move the visible playhead.
+        sync_state_from_engine_clock(&mut active.state, active.engine.clock_snapshot());
         active.snapshot.state_revision = active.snapshot.state_revision.saturating_add(1);
         (
             active.snapshot.owner.clone(),

@@ -198,45 +198,6 @@ impl AudioEngine {
             })
             .map_err(|error| format!("failed to start audio output holder: {error}"))?;
 
-        let running_position = running.clone();
-        let atomics_position = atomics.clone();
-        let atomics_for_position_thread = atomics_position.clone();
-        let position_events = event_tx.clone();
-        std::thread::Builder::new()
-            .name("heya-audio-position".into())
-            .spawn(move || {
-                let mut last_published_frames = u64::MAX;
-                while running_position.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_millis(250));
-                    let state = atomics_for_position_thread.get_state();
-                    if state == EngineState::Stopped {
-                        continue;
-                    }
-                    let frames = atomics_for_position_thread
-                        .position_frames
-                        .load(Ordering::Relaxed);
-                    // Paused position can only move via a seek; republishing the
-                    // same frame 4×/sec just wakes the event relay and webview.
-                    if state == EngineState::Paused && frames == last_published_frames {
-                        continue;
-                    }
-                    last_published_frames = frames;
-                    let duration_ms = atomics_for_position_thread
-                        .duration_ms
-                        .load(Ordering::Relaxed);
-                    let divisor = u64::from(device_sample_rate);
-                    if divisor == 0 {
-                        continue;
-                    }
-                    let position_ms = ((frames as f64 / divisor as f64) * 1000.0) as u64;
-                    let _ = position_events.try_send(EngineEvent::Position {
-                        position_ms: position_ms.min(duration_ms),
-                        duration_ms,
-                    });
-                }
-            })
-            .map_err(|error| format!("failed to start position publisher: {error}"))?;
-
         let running_visualizer = running.clone();
         let visualizer_events = event_tx.clone();
         std::thread::Builder::new()
@@ -266,6 +227,7 @@ impl AudioEngine {
             .map_err(|error| format!("failed to start visualizer: {error}"))?;
 
         let running_control = running.clone();
+        let clock_atomics = atomics.clone();
         let stream_ctl_for_control = stream_ctl_tx.clone();
         std::thread::Builder::new()
             .name("heya-audio-control".into())
@@ -287,7 +249,7 @@ impl AudioEngine {
 
         Ok(Self {
             cmd_tx,
-            atomics: atomics_position,
+            atomics: clock_atomics,
             event_rx,
             running,
             stream_ctl_tx,

@@ -248,7 +248,7 @@ impl AudioCallbackState {
         // 10. Handle duck-and-apply countdown
         self.tick_duck(output_frames as u32);
 
-        // 11. Send visualizer data (~60fps) — silence carries nothing worth
+        // 11. Send visualizer data (~30fps) — silence carries nothing worth
         //     an FFT + webview event
         if rendered_audio {
             self.maybe_send_vis_frame(data);
@@ -262,16 +262,20 @@ impl AudioCallbackState {
     fn drain_sample_batches(&mut self) {
         let deferred = self.deferred_deck_load.as_ref().map(|load| load.deck);
         if deferred != Some(DeckId::A) {
-            self.drain_deck_channel(&self.deck_a_rx.clone(), DeckId::A);
+            self.drain_deck_channel(DeckId::A);
         }
         if deferred != Some(DeckId::B) {
-            self.drain_deck_channel(&self.deck_b_rx.clone(), DeckId::B);
+            self.drain_deck_channel(DeckId::B);
         }
     }
 
-    fn drain_deck_channel(&mut self, rx: &Receiver<SampleBatch>, deck_id: DeckId) {
+    fn drain_deck_channel(&mut self, deck_id: DeckId) {
         for _ in 0..MAX_SAMPLE_BATCHES_PER_DECK_CALLBACK {
-            let Ok(batch) = rx.try_recv() else {
+            let batch = match deck_id {
+                DeckId::A => self.deck_a_rx.try_recv(),
+                DeckId::B => self.deck_b_rx.try_recv(),
+            };
+            let Ok(batch) = batch else {
                 break;
             };
             let deck = self.deck_mgr.deck_mut(deck_id);
@@ -934,8 +938,9 @@ impl AudioCallbackState {
             return;
         }
         self.vis_frame_accum += data.len() as u64;
-        // ~60fps: at 48kHz stereo, 48000*2/60 = 1600 samples per vis frame
-        let frames_per_vis = (self.device_sample_rate as u64 * self.device_channels as u64) / 60;
+        // 30 Hz is fluid enough for the UI and halves FFT work plus the
+        // serialized Rust -> WebView transport versus the old 60 Hz stream.
+        let frames_per_vis = (self.device_sample_rate as u64 * self.device_channels as u64) / 30;
         if frames_per_vis == 0 || self.vis_frame_accum < frames_per_vis {
             return;
         }
