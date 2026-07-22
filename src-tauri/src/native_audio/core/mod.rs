@@ -27,7 +27,7 @@ use self::command::{AudioCommand, Command, SampleBatch};
 use self::crossfade::types::{parse_ramp, CrossfadeSettings, TrackRamps};
 use self::deck::decode;
 use self::event::EngineEvent;
-use self::output::resample::resample_buffer;
+use self::output::resample::StreamingResampler;
 use self::output::CpalOutput;
 use self::types::{AudioSource, DeckId, EngineState, TrackMeta};
 use self::visualizer::VisualizerProcessor;
@@ -402,27 +402,42 @@ fn control_thread_main(
                         }
                     }
                     Command::PreloadNext { source, meta } => {
+                        let active_rk = atomics.active_rating_key.load(Ordering::Relaxed);
+                        let preload_error_rk = atomics.preload_error_rk.load(Ordering::Relaxed);
                         let deck = pending_deck(&atomics);
-                        info!(
-                            rating_key = meta.rating_key,
-                            ?deck,
-                            active_deck = atomics.active_deck_id.load(Ordering::Relaxed),
-                            "PRELOAD command"
-                        );
-                        pending_rating_key = meta.rating_key;
-                        handle_preload(
-                            &source,
-                            &meta,
-                            deck,
-                            &audio_cmd_tx,
-                            deck_tx(deck, &deck_a_tx, &deck_b_tx),
-                            &event_tx,
-                            &atomics,
-                            &crossfade_settings,
-                            normalization_enabled,
-                            device_sample_rate,
-                            device_channels,
-                        );
+                        if should_ignore_duplicate_preload(
+                            pending_rating_key,
+                            active_rk,
+                            preload_error_rk,
+                            meta.rating_key,
+                        ) {
+                            debug!(
+                                rating_key = meta.rating_key,
+                                ?deck,
+                                "ignoring duplicate preload for prepared pending track"
+                            );
+                        } else {
+                            info!(
+                                rating_key = meta.rating_key,
+                                ?deck,
+                                active_deck = atomics.active_deck_id.load(Ordering::Relaxed),
+                                "PRELOAD command"
+                            );
+                            pending_rating_key = meta.rating_key;
+                            handle_preload(
+                                &source,
+                                &meta,
+                                deck,
+                                &audio_cmd_tx,
+                                deck_tx(deck, &deck_a_tx, &deck_b_tx),
+                                &event_tx,
+                                &atomics,
+                                &crossfade_settings,
+                                normalization_enabled,
+                                device_sample_rate,
+                                device_channels,
+                            );
+                        }
                     }
                     Command::Pause => {
                         let _ = audio_cmd_tx.send(AudioCommand::Pause);
@@ -564,6 +579,18 @@ fn deck_tx<'a>(
     }
 }
 
+fn should_ignore_duplicate_preload(
+    pending_rating_key: i64,
+    active_rating_key: i64,
+    preload_error_rating_key: i64,
+    requested_rating_key: i64,
+) -> bool {
+    requested_rating_key != 0
+        && pending_rating_key == requested_rating_key
+        && active_rating_key != requested_rating_key
+        && preload_error_rating_key != requested_rating_key
+}
+
 // ---------------------------------------------------------------------------
 // Play / Preload handlers
 // ---------------------------------------------------------------------------
@@ -601,6 +628,9 @@ fn handle_play(
 
     match fetch_and_decode_incremental(source, meta.rating_key, device_rate, device_channels) {
         Ok(result) => {
+            if atomics.preload_error_rk.load(Ordering::Relaxed) == meta.rating_key {
+                atomics.preload_error_rk.store(0, Ordering::Relaxed);
+            }
             let source_rate = result.source_rate;
             let source_channels = result.source_channels;
             let has_more = result.has_more;
@@ -674,6 +704,7 @@ fn handle_play(
             if let Some(decoder) = result.decoder {
                 spawn_background_decode(
                     decoder,
+                    result.resampler,
                     meta.rating_key,
                     source_rate,
                     source_channels,
@@ -728,6 +759,9 @@ fn handle_preload(
 
     match fetch_and_decode_incremental(source, meta.rating_key, device_rate, device_channels) {
         Ok(result) => {
+            if atomics.preload_error_rk.load(Ordering::Relaxed) == meta.rating_key {
+                atomics.preload_error_rk.store(0, Ordering::Relaxed);
+            }
             let source_rate = result.source_rate;
             let source_channels = result.source_channels;
             let has_more = result.has_more;
@@ -806,6 +840,7 @@ fn handle_preload(
             if let Some(decoder) = result.decoder {
                 spawn_background_decode(
                     decoder,
+                    result.resampler,
                     meta.rating_key,
                     source_rate,
                     source_channels,
@@ -857,6 +892,7 @@ fn handle_seek(position_ms: u64, audio_cmd_tx: &Sender<AudioCommand>) {
 #[allow(clippy::too_many_arguments)]
 fn spawn_background_decode(
     mut decoder: decode::DecoderSetup,
+    mut resampler: Option<StreamingResampler>,
     rating_key: i64,
     source_rate: u32,
     source_channels: u16,
@@ -915,6 +951,13 @@ fn spawn_background_decode(
                         Ok(seeked) => {
                             decoder.decoder.reset();
                             decoder.finished = false;
+                            if source_rate != device_sample_rate {
+                                resampler = Some(StreamingResampler::new(
+                                    source_channels,
+                                    source_rate,
+                                    device_sample_rate,
+                                ));
+                            }
                             // Update generation — new batches get the new generation
                             current_gen = gen_signal.load(Ordering::Relaxed);
                             debug!(
@@ -944,20 +987,21 @@ fn spawn_background_decode(
                     }
                 }
 
+                // Loading a different track into this physical deck advances
+                // its generation. Stop the superseded decoder instead of
+                // wasting I/O/CPU and filling the channel with stale batches.
+                if gen_signal.load(Ordering::Relaxed) != current_gen {
+                    debug!(rating_key, ?deck, current_gen, "bg decode: superseded");
+                    return;
+                }
+
                 match decode::decode_batch(&mut decoder, batch_size) {
                     Ok(batch) if !batch.is_empty() => {
-                        let mut samples = batch;
-
-                        if source_rate != device_sample_rate {
-                            if let Some(resampled) = resample_buffer(
-                                &samples,
-                                source_channels,
-                                source_rate,
-                                device_sample_rate,
-                            ) {
-                                samples = resampled;
-                            }
-                        }
+                        let mut samples = if let Some(resampler) = resampler.as_mut() {
+                            resampler.process(&batch)
+                        } else {
+                            batch
+                        };
 
                         if source_channels == 1 && device_channels >= 2 {
                             let mut stereo = Vec::with_capacity(samples.len() * 2);
@@ -991,10 +1035,20 @@ fn spawn_background_decode(
                                 .store(rating_key, Ordering::Relaxed);
                         } else {
                             debug!(rating_key, "bg decode: complete");
+                            let mut samples = resampler
+                                .as_mut()
+                                .map_or_else(Vec::new, StreamingResampler::finish);
+                            if source_channels == 1 && device_channels >= 2 {
+                                let mut stereo = Vec::with_capacity(samples.len() * 2);
+                                for &sample in &samples {
+                                    stereo.extend_from_slice(&[sample, sample]);
+                                }
+                                samples = stereo;
+                            }
                             let _ = sample_tx.send(SampleBatch {
                                 rating_key,
                                 generation: current_gen,
-                                samples: Vec::new(),
+                                samples,
                                 fully_decoded: true,
                             });
                         }
@@ -1026,6 +1080,7 @@ struct IncrementalDecodeResult {
     decoder: Option<decode::DecoderSetup>,
     source_rate: u32,
     source_channels: u16,
+    resampler: Option<StreamingResampler>,
     aborted: bool,
 }
 
@@ -1172,11 +1227,12 @@ fn decode_initial_batch(
         "initial decode batch ready"
     );
 
-    if source_rate != device_rate {
-        if let Some(resampled) =
-            resample_buffer(&samples, source_channels, source_rate, device_rate)
-        {
-            samples = resampled;
+    let mut resampler = (source_rate != device_rate)
+        .then(|| StreamingResampler::new(source_channels, source_rate, device_rate));
+    if let Some(streaming_resampler) = resampler.as_mut() {
+        samples = streaming_resampler.process(&samples);
+        if setup.finished && !setup.aborted {
+            samples.extend(streaming_resampler.finish());
         }
     }
 
@@ -1200,6 +1256,7 @@ fn decode_initial_batch(
         decoder: None, // caller fills this
         source_rate,
         source_channels,
+        resampler,
         aborted: setup.aborted,
     })
 }
@@ -1277,5 +1334,13 @@ mod tests {
                 active_track_id: Some(42),
             }
         );
+    }
+
+    #[test]
+    fn duplicate_preload_is_ignored_until_track_becomes_active_or_fails() {
+        assert!(should_ignore_duplicate_preload(42, 7, 0, 42));
+        assert!(!should_ignore_duplicate_preload(42, 42, 0, 42));
+        assert!(!should_ignore_duplicate_preload(42, 7, 42, 42));
+        assert!(!should_ignore_duplicate_preload(42, 7, 0, 43));
     }
 }

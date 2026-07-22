@@ -49,6 +49,12 @@ impl Scheduler {
         self.fired = false;
     }
 
+    /// Re-arm the current transition point when the pending deck has not built
+    /// enough PCM safety margin yet. The next callback will check it again.
+    pub fn retry(&mut self) {
+        self.fired = false;
+    }
+
     #[cfg(test)]
     pub fn has_fired(&self) -> bool {
         self.fired
@@ -130,5 +136,15 @@ mod tests {
         s.reset();
         s.set_transition_point(18.0);
         assert!(s.check(18.0, 20.0).is_some());
+    }
+
+    #[test]
+    fn retry_rechecks_the_same_transition_point() {
+        let mut s = Scheduler::new();
+        s.set_mode(SchedulerMode::Gapless);
+        s.set_transition_point(10.0);
+        assert_eq!(s.check(10.0, 10.0), Some(SchedulerAction::GaplessPoint));
+        s.retry();
+        assert_eq!(s.check(10.0, 10.0), Some(SchedulerAction::GaplessPoint));
     }
 }
