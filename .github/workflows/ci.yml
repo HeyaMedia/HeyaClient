@@ -22,9 +22,9 @@ jobs:
       matrix:
         include:
           - name: macOS ARM64
-            os: macos-15
+            os: blacksmith-6vcpu-macos-15
           - name: Windows x64
-            os: windows-2025
+            os: blacksmith-4vcpu-windows-2025
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
 
