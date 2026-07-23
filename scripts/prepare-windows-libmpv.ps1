@@ -106,9 +106,10 @@ $libraryHandle = [HeyaNativeLibrary]::LoadLibraryEx($dll, [IntPtr]::Zero, 0x0000
 if ($libraryHandle -eq [IntPtr]::Zero) {
     $loadError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
     $loadMessage = [ComponentModel.Win32Exception]::new($loadError).Message
-    throw "The verified provider library is not loadable (Win32 error ${loadError}: ${loadMessage})."
+    Write-Warning "The verified provider library is not loadable on this Windows image (Win32 error ${loadError}: ${loadMessage}). Compile-time validation can continue, but runtime adapter tests require Desktop/App Compatibility components."
+} else {
+    [void][HeyaNativeLibrary]::FreeLibrary($libraryHandle)
 }
-[void][HeyaNativeLibrary]::FreeLibrary($libraryHandle)
 
 $receipt = [ordered]@{
     schemaVersion = 1
