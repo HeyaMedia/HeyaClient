@@ -1,6 +1,6 @@
 [package]
 name = "heya-client"
-version = "0.2.20"
+version = "0.2.21"
 description = "Cross-platform native client for Heya"
 authors = ["HeyaMedia"]
 license = "MIT"
