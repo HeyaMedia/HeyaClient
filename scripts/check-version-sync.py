@@ -6,11 +6,29 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import sys
-import tomllib
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def cargo_package_version() -> str:
+    cargo_toml = (ROOT / "src-tauri" / "Cargo.toml").read_text()
+    package = re.search(
+        r"(?ms)^\[package\]\s*$\n(?P<body>.*?)(?=^\[|\Z)",
+        cargo_toml,
+    )
+    if package is None:
+        raise ValueError("Cargo.toml does not contain a [package] section")
+    version = re.search(
+        r'^version\s*=\s*"(?P<version>[^"]+)"\s*(?:#.*)?$',
+        package.group("body"),
+        re.MULTILINE,
+    )
+    if version is None:
+        raise ValueError("Cargo.toml [package] section does not contain a version")
+    return version.group("version")
 
 
 def main() -> int:
@@ -18,8 +36,7 @@ def main() -> int:
     tauri_version = json.loads(
         (ROOT / "src-tauri" / "tauri.conf.json").read_text()
     )["version"]
-    with (ROOT / "src-tauri" / "Cargo.toml").open("rb") as cargo_file:
-        cargo_version = tomllib.load(cargo_file)["package"]["version"]
+    cargo_version = cargo_package_version()
 
     versions = {
         "package.json": package_version,
