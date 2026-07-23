@@ -1482,10 +1482,14 @@ fn fetch_and_decode_incremental(
         .recv_timeout(Duration::from_secs(60))
         .map_err(|_| "native audio response metadata timed out".to_string())?
         .map_err(str::to_string)?;
+    let initial_bytes = shared
+        .wait_until_readable()
+        .map_err(|error| format!("native audio response body is unavailable: {error}"))?;
     log::info!(
-        "native audio response ready track={} content_length={}",
+        "native audio response ready track={} content_length={} initial_bytes={}",
         rating_key,
         content_length,
+        initial_bytes,
     );
 
     let reader = StreamingReader::new(shared);

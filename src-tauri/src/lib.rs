@@ -15,6 +15,7 @@ use serde::Serialize;
 use server_profile::{AppSettings, AppState, ServerProfile};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, State, WebviewWindow};
+use tauri_plugin_opener::OpenerExt;
 
 #[derive(Serialize)]
 pub(crate) struct NativePlaybackStatus {
@@ -93,6 +94,19 @@ fn get_native_audio_status(
     audio: State<'_, native_audio::NativeAudioManager>,
 ) -> NativeAudioStatus {
     native_audio_status(&audio)
+}
+
+#[tauri::command]
+fn open_log_directory(app: AppHandle, invoking_window: WebviewWindow) -> Result<(), String> {
+    navigation::ensure_local_settings_window(&invoking_window, "Log access")?;
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&log_dir).map_err(|error| error.to_string())?;
+    app.opener()
+        .open_path(log_dir.to_string_lossy().into_owned(), None::<&str>)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn native_audio_status(audio: &native_audio::NativeAudioManager) -> NativeAudioStatus {
@@ -226,6 +240,7 @@ pub fn run() {
             get_native_playback_status,
             install_native_playback_runtime,
             get_native_audio_status,
+            open_log_directory,
             save_app_settings,
             connect_to_server,
             forget_server,

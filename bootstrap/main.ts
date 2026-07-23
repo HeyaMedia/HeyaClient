@@ -127,6 +127,9 @@ const nativeAudioStatusDetail = requiredElement<HTMLElement>(
 const refreshNativeAudioButton = requiredElement<HTMLButtonElement>(
   "refresh-native-audio-button",
 );
+const openLogDirectoryButton = requiredElement<HTMLButtonElement>(
+  "open-log-directory-button",
+);
 const updateStatus = requiredElement<HTMLDivElement>("update-status");
 const updateStatusTitle = requiredElement<HTMLElement>("update-status-title");
 const updateStatusDetail = requiredElement<HTMLElement>("update-status-detail");
@@ -249,6 +252,16 @@ installNativePlaybackButton.addEventListener("click", () => {
 
 refreshNativeAudioButton.addEventListener("click", () => {
   void refreshNativeAudioStatus();
+});
+
+openLogDirectoryButton.addEventListener("click", async () => {
+  try {
+    await invoke("open_log_directory");
+  } catch (error) {
+    nativeAudioStatus.dataset.available = "false";
+    nativeAudioStatusTitle.textContent = "Couldn’t open logs";
+    nativeAudioStatusDetail.textContent = errorMessage(error);
+  }
 });
 
 checkUpdateButton.addEventListener("click", () => {

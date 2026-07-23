@@ -262,6 +262,10 @@ impl NativeAudioManager {
         track: ValidatedAudioTrack,
     ) -> Result<AudioCommandResult, BridgeError> {
         self.execute(owner, renderer_session_id, command_id, |active| {
+            let clock = active.engine.clock_snapshot();
+            if clock.active_track_id != active.state.current_track_id {
+                return Err("the current native audio track is not ready for preloading".into());
+            }
             active.engine.send(EngineCommand::PreloadNext {
                 source: track.source,
                 meta: track.meta,

@@ -461,6 +461,12 @@ button:disabled {
   white-space: nowrap;
 }
 
+.native-status-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .update-progress {
   margin-top: 10px;
   display: grid;

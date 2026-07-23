@@ -87,6 +87,32 @@ impl SharedBuffer {
         self.abandoned.load(Ordering::Relaxed)
     }
 
+    /// Wait until the spool contains at least one byte before constructing
+    /// Symphonia's probing buffer. HTTP response metadata arrives before the
+    /// body, and some format probers treat an initially-empty seekable source
+    /// as a definitive EOF instead of retrying the blocking reader.
+    pub fn wait_until_readable(&self) -> io::Result<u64> {
+        let inner = self.inner.lock().unwrap();
+        let inner = self
+            .condvar
+            .wait_while(inner, |state| state.downloaded_len == 0 && !state.done)
+            .unwrap();
+
+        if inner.aborted {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "stream download aborted before audio data arrived",
+            ));
+        }
+        if inner.downloaded_len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "audio response contained no data",
+            ));
+        }
+        Ok(inner.downloaded_len)
+    }
+
     /// Set the content length once known (from HTTP Content-Length header).
     pub fn set_content_length(&self, len: u64) {
         let mut inner = self.inner.lock().unwrap();
@@ -243,5 +269,27 @@ mod tests {
         reader.read_to_string(&mut out).unwrap();
         writer.join().unwrap();
         assert_eq!(out, "0123456789");
+    }
+
+    #[test]
+    fn readiness_waits_for_the_first_body_bytes() {
+        let buf = SharedBuffer::new(Some(1024)).unwrap();
+        let writer = buf.clone();
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            writer.push(b"fLaC").unwrap();
+        });
+
+        assert_eq!(buf.wait_until_readable().unwrap(), 4);
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn readiness_rejects_an_empty_completed_response() {
+        let buf = SharedBuffer::new(Some(0)).unwrap();
+        buf.finish();
+
+        let error = buf.wait_until_readable().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 }
