@@ -62,6 +62,54 @@ if (-not (Test-Path $dll -PathType Leaf)) {
     throw "The verified provider archive did not contain libmpv-2.dll."
 }
 
+$dumpbin = Get-Command "dumpbin.exe" -ErrorAction SilentlyContinue
+if ($null -ne $dumpbin) {
+    $dependencyNames = @(
+        & $dumpbin.Source /dependents $dll |
+            Select-String -Pattern '^\s+([A-Za-z0-9_.-]+\.dll)\s*$' |
+            ForEach-Object { $_.Matches[0].Groups[1].Value } |
+            Sort-Object -Unique
+    )
+    foreach ($dependency in $dependencyNames) {
+        $runtimeDependency = Join-Path $extractDirectory $dependency
+        $systemDependency = Join-Path "$env:SystemRoot/System32" $dependency
+        $availability = if (Test-Path $runtimeDependency -PathType Leaf) {
+            "provider"
+        } elseif (Test-Path $systemDependency -PathType Leaf) {
+            "system"
+        } elseif ($dependency.StartsWith("api-ms-", [StringComparison]::OrdinalIgnoreCase)) {
+            "Windows API set"
+        } else {
+            "MISSING"
+        }
+        Write-Host "libmpv dependency: $dependency ($availability)"
+    }
+}
+
+if ($null -eq ("HeyaNativeLibrary" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class HeyaNativeLibrary {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern IntPtr LoadLibraryEx(string path, IntPtr file, uint flags);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool FreeLibrary(IntPtr module);
+}
+'@
+}
+
+$libraryHandle = [HeyaNativeLibrary]::LoadLibraryEx($dll, [IntPtr]::Zero, 0x00000100 -bor 0x00000800)
+if ($libraryHandle -eq [IntPtr]::Zero) {
+    $loadError = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    $loadMessage = [ComponentModel.Win32Exception]::new($loadError).Message
+    throw "The verified provider library is not loadable (Win32 error ${loadError}: ${loadMessage})."
+}
+[void][HeyaNativeLibrary]::FreeLibrary($libraryHandle)
+
 $receipt = [ordered]@{
     schemaVersion = 1
     provider = [string]$manifest.windows.provider
