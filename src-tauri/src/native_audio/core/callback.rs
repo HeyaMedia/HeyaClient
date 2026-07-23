@@ -55,8 +55,14 @@ pub struct SharedAtomics {
     // Seek coordination — control task writes, bg decode reads
     pub deck_a_seek_ms: Arc<AtomicI64>,
     pub deck_b_seek_ms: Arc<AtomicI64>,
+    /// PCM epochs change on both deck replacement and out-of-buffer seeks so
+    /// the callback can reject samples decoded before the latest seek.
     pub deck_a_generation: Arc<AtomicU64>,
     pub deck_b_generation: Arc<AtomicU64>,
+    /// Stream ownership changes only when a physical deck is replaced or
+    /// stopped. Seek epochs must never cancel the HTTP download they rely on.
+    pub deck_a_stream_generation: Arc<AtomicU64>,
+    pub deck_b_stream_generation: Arc<AtomicU64>,
     /// Track whose initial pending-deck PCM has been prepared.
     pub preload_ready_rk: Arc<AtomicI64>,
     /// Manual play/next request waiting for an in-flight preload to become ready.
@@ -80,6 +86,8 @@ impl SharedAtomics {
             deck_b_seek_ms: Arc::new(AtomicI64::new(-1)),
             deck_a_generation: Arc::new(AtomicU64::new(0)),
             deck_b_generation: Arc::new(AtomicU64::new(0)),
+            deck_a_stream_generation: Arc::new(AtomicU64::new(0)),
+            deck_b_stream_generation: Arc::new(AtomicU64::new(0)),
             preload_ready_rk: Arc::new(AtomicI64::new(0)),
             activate_when_ready_rk: Arc::new(AtomicI64::new(0)),
             preload_error_rk: Arc::new(AtomicI64::new(0)),
@@ -118,6 +126,10 @@ pub struct AudioCallbackState {
     crossfade_uses_curves: bool,
     deferred_deck_load: Option<DeferredDeckLoad>,
     deferred_transition: Option<(i64, u64, bool)>,
+    /// Latest seek accepted before the first deck becomes active. Loads and
+    /// rapid skip-then-seek interactions can queue commands before the
+    /// asynchronous decoder has produced its initial PCM.
+    pending_seek_ms: Option<usize>,
     deferred_sample_a: Option<SampleBatch>,
     deferred_sample_b: Option<SampleBatch>,
     pub normalization_enabled: bool,
@@ -176,6 +188,7 @@ impl AudioCallbackState {
             crossfade_uses_curves: false,
             deferred_deck_load: None,
             deferred_transition: None,
+            pending_seek_ms: None,
             deferred_sample_a: None,
             deferred_sample_b: None,
             normalization_enabled: true,
@@ -463,6 +476,7 @@ impl AudioCallbackState {
                     let _ = self.retired_buffer_tx.try_send(retired.sample_buffer);
                 }
                 self.deferred_transition = None;
+                self.pending_seek_ms = None;
                 self.paused = false;
                 self.set_state(EngineState::Stopped);
                 let _ = self.event_tx.try_send(EngineEvent::State {
@@ -494,64 +508,14 @@ impl AudioCallbackState {
                 }
             }
             AudioCommand::SeekInBuffer { position } => {
-                // `position` is encoded as milliseconds from the control thread
-                let position_ms = position;
-                let active = self.deck_mgr.active_deck_mut();
-                if active.loaded && active.channels > 0 && active.sample_rate > 0 {
-                    let target_sample = (position_ms as f32 / 1000.0
-                        * active.sample_rate as f32
-                        * active.channels as f32) as usize;
-
-                    let buffer_end = active.sample_offset + active.samples.len();
-                    let in_buffer =
-                        target_sample >= active.sample_offset && target_sample <= buffer_end;
-
-                    if in_buffer {
-                        let consumed = active.samples.consume(target_sample - active.sample_offset);
-                        active.sample_offset = active.sample_offset.saturating_add(consumed);
-                    } else {
-                        // Outside the bounded decoded window — ask the
-                        // persistent decoder worker to seek and refill it.
-                        let out_ch = active.channels as usize;
-                        let new_offset = (position_ms as f64 / 1000.0
-                            * self.device_sample_rate as f64
-                            * out_ch as f64) as usize;
-                        let new_gen = active.generation + 1;
-                        active.samples.clear();
-                        active.sample_offset = new_offset;
-                        active.fully_decoded = false;
-                        active.generation = new_gen;
-
-                        // Signal bg decode thread via atomics
-                        let active_id = self.deck_mgr.active_id();
-                        match active_id {
-                            DeckId::A => {
-                                self.atomics
-                                    .deck_a_generation
-                                    .store(new_gen, Ordering::Relaxed);
-                                self.atomics
-                                    .deck_a_seek_ms
-                                    .store(position_ms as i64, Ordering::Relaxed);
-                            }
-                            DeckId::B => {
-                                self.atomics
-                                    .deck_b_generation
-                                    .store(new_gen, Ordering::Relaxed);
-                                self.atomics
-                                    .deck_b_seek_ms
-                                    .store(position_ms as i64, Ordering::Relaxed);
-                            }
-                        }
-
-                        self.set_state(EngineState::Buffering);
-                        let _ = self.event_tx.try_send(EngineEvent::State {
-                            state: "buffering".into(),
-                        });
-                    }
+                if self.deck_mgr.active_deck().loaded {
+                    self.seek_active_deck(position);
+                } else {
+                    // Play/load is asynchronous. Keep only the latest target;
+                    // it is applied after TransitionToActive installs the deck.
+                    self.pending_seek_ms = Some(position);
                 }
                 self.dsp_chain.reset();
-                self.scheduler.reset();
-                self.compute_and_set_schedule();
             }
             AudioCommand::SetVolume(gain) => {
                 self.dsp_chain.set_volume(gain);
@@ -847,6 +811,69 @@ impl AudioCallbackState {
             });
         }
 
+        self.compute_and_set_schedule();
+        if let Some(position_ms) = self.pending_seek_ms.take() {
+            self.seek_active_deck(position_ms);
+        }
+    }
+
+    fn seek_active_deck(&mut self, position_ms: usize) {
+        let active = self.deck_mgr.active_deck_mut();
+        if !active.loaded || active.channels == 0 || active.sample_rate == 0 {
+            self.pending_seek_ms = Some(position_ms);
+            return;
+        }
+
+        let target_sample = (position_ms as f32 / 1000.0
+            * active.sample_rate as f32
+            * active.channels as f32) as usize;
+        let buffer_end = active.sample_offset + active.samples.len();
+        let in_buffer = target_sample >= active.sample_offset && target_sample <= buffer_end;
+
+        if in_buffer {
+            let consumed = active.samples.consume(target_sample - active.sample_offset);
+            active.sample_offset = active.sample_offset.saturating_add(consumed);
+        } else {
+            // Outside the bounded decoded window — ask the persistent decoder
+            // worker to seek and refill it. PCM generation advances to reject
+            // already-queued batches; stream ownership deliberately does not.
+            let out_ch = active.channels as usize;
+            let new_offset = (position_ms as f64 / 1000.0
+                * self.device_sample_rate as f64
+                * out_ch as f64) as usize;
+            let new_gen = active.generation + 1;
+            active.samples.clear();
+            active.sample_offset = new_offset;
+            active.fully_decoded = false;
+            active.generation = new_gen;
+
+            let active_id = self.deck_mgr.active_id();
+            match active_id {
+                DeckId::A => {
+                    self.atomics
+                        .deck_a_seek_ms
+                        .store(position_ms as i64, Ordering::Relaxed);
+                    self.atomics
+                        .deck_a_generation
+                        .store(new_gen, Ordering::Release);
+                }
+                DeckId::B => {
+                    self.atomics
+                        .deck_b_seek_ms
+                        .store(position_ms as i64, Ordering::Relaxed);
+                    self.atomics
+                        .deck_b_generation
+                        .store(new_gen, Ordering::Release);
+                }
+            }
+
+            self.set_state(EngineState::Buffering);
+            let _ = self.event_tx.try_send(EngineEvent::State {
+                state: "buffering".into(),
+            });
+        }
+
+        self.scheduler.reset();
         self.compute_and_set_schedule();
     }
 
@@ -1434,6 +1461,73 @@ mod tests {
 
         assert_eq!(callback.deck_mgr.active_id(), DeckId::A);
         assert_eq!(callback.deck_mgr.active_deck().rating_key(), 0);
+    }
+
+    #[test]
+    fn rapid_out_of_buffer_seeks_keep_stream_owned_and_publish_latest_position() {
+        let (mut callback, _) = callback();
+        callback.device_sample_rate = 10;
+        callback.device_channels = 2;
+        load(
+            &mut callback,
+            DeckId::B,
+            meta(2, 100_000, "album:2", 0.0),
+            10,
+            2,
+            vec![0.5; 20],
+        );
+        callback.handle_transition_to_active(true);
+
+        callback.handle_command(AudioCommand::SeekInBuffer { position: 50_000 });
+        callback.handle_command(AudioCommand::SeekInBuffer { position: 25_000 });
+
+        assert_eq!(callback.deck_mgr.active_deck().generation, 2);
+        assert_eq!(
+            callback.atomics.deck_b_generation.load(Ordering::Acquire),
+            2
+        );
+        assert_eq!(
+            callback
+                .atomics
+                .deck_b_stream_generation
+                .load(Ordering::Acquire),
+            0,
+            "seeking must not relinquish the current download"
+        );
+        assert_eq!(
+            callback.atomics.deck_b_seek_ms.load(Ordering::Acquire),
+            25_000,
+            "the decoder should coalesce rapid seeks onto the newest target"
+        );
+    }
+
+    #[test]
+    fn seek_before_first_pcm_is_applied_when_the_deck_becomes_active() {
+        let (mut callback, _) = callback();
+        callback.device_sample_rate = 10;
+        callback.device_channels = 2;
+
+        callback.handle_command(AudioCommand::SeekInBuffer { position: 50_000 });
+        assert_eq!(callback.pending_seek_ms, Some(50_000));
+
+        load(
+            &mut callback,
+            DeckId::B,
+            meta(2, 100_000, "album:2", 0.0),
+            10,
+            2,
+            vec![0.5; 20],
+        );
+        callback.handle_transition_to_active(true);
+
+        assert_eq!(callback.pending_seek_ms, None);
+        assert_eq!(callback.deck_mgr.active_deck().generation, 1);
+        assert!(callback.deck_mgr.active_deck().samples.is_empty());
+        assert_eq!(
+            callback.atomics.deck_b_seek_ms.load(Ordering::Acquire),
+            50_000
+        );
+        assert_eq!(callback.state(), EngineState::Buffering);
     }
 
     #[test]

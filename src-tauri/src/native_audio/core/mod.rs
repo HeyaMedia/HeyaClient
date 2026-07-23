@@ -69,8 +69,26 @@ fn deck_generation(atomics: &SharedAtomics, deck: DeckId) -> Arc<AtomicU64> {
     }
 }
 
-fn next_deck_generation(atomics: &SharedAtomics, deck: DeckId) -> u64 {
-    deck_generation(atomics, deck).fetch_add(1, Ordering::Relaxed) + 1
+fn deck_stream_generation(atomics: &SharedAtomics, deck: DeckId) -> Arc<AtomicU64> {
+    match deck {
+        DeckId::A => atomics.deck_a_stream_generation.clone(),
+        DeckId::B => atomics.deck_b_stream_generation.clone(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeckGenerations {
+    pcm: u64,
+    stream: u64,
+}
+
+fn next_deck_generations(atomics: &SharedAtomics, deck: DeckId) -> DeckGenerations {
+    // Publish new stream ownership before the PCM epoch. A decoder that sees
+    // the PCM replacement can therefore also observe that its download is no
+    // longer owned by this deck.
+    let stream = deck_stream_generation(atomics, deck).fetch_add(1, Ordering::AcqRel) + 1;
+    let pcm = deck_generation(atomics, deck).fetch_add(1, Ordering::AcqRel) + 1;
+    DeckGenerations { pcm, stream }
 }
 
 pub struct AudioEngine {
@@ -108,6 +126,7 @@ fn spawn_load_job(
     meta: TrackMeta,
     deck: DeckId,
     generation: u64,
+    stream_generation: u64,
     audio_cmd_tx: Sender<AudioCommand>,
     sample_tx: Sender<SampleBatch>,
     event_tx: Sender<EngineEvent>,
@@ -127,6 +146,7 @@ fn spawn_load_job(
                 &meta,
                 deck,
                 generation,
+                stream_generation,
                 &audio_cmd_tx,
                 &sample_tx,
                 &worker_event_tx,
@@ -140,6 +160,7 @@ fn spawn_load_job(
                 &meta,
                 deck,
                 generation,
+                stream_generation,
                 &audio_cmd_tx,
                 &sample_tx,
                 &worker_event_tx,
@@ -484,7 +505,7 @@ fn control_thread_main(
                                 atomics.preload_error_rk.store(0, Ordering::Relaxed);
                             }
                             let deck = pending;
-                            let generation = next_deck_generation(&atomics, deck);
+                            let generations = next_deck_generations(&atomics, deck);
                             atomics.preload_ready_rk.store(0, Ordering::Relaxed);
                             atomics.activate_when_ready_rk.store(0, Ordering::Relaxed);
                             if active_rk == 0 {
@@ -498,7 +519,8 @@ fn control_thread_main(
                                 source,
                                 meta,
                                 deck,
-                                generation,
+                                generations.pcm,
+                                generations.stream,
                                 audio_cmd_tx.clone(),
                                 deck_tx(deck, &deck_a_tx, &deck_b_tx).clone(),
                                 event_tx.clone(),
@@ -536,7 +558,7 @@ fn control_thread_main(
                             atomics.preload_ready_rk.store(0, Ordering::Relaxed);
                             atomics.activate_when_ready_rk.store(0, Ordering::Relaxed);
                             atomics.preload_error_rk.store(0, Ordering::Relaxed);
-                            let generation = next_deck_generation(&atomics, deck);
+                            let generations = next_deck_generations(&atomics, deck);
                             let _ = event_tx.send(EngineEvent::PreloadLoading {
                                 rating_key: meta.rating_key,
                             });
@@ -545,7 +567,8 @@ fn control_thread_main(
                                 source,
                                 meta,
                                 deck,
-                                generation,
+                                generations.pcm,
+                                generations.stream,
                                 audio_cmd_tx.clone(),
                                 deck_tx(deck, &deck_a_tx, &deck_b_tx).clone(),
                                 event_tx.clone(),
@@ -563,6 +586,12 @@ fn control_thread_main(
                         let _ = audio_cmd_tx.send(AudioCommand::Resume);
                     }
                     Command::Stop => {
+                        atomics
+                            .deck_a_stream_generation
+                            .fetch_add(1, Ordering::Release);
+                        atomics
+                            .deck_b_stream_generation
+                            .fetch_add(1, Ordering::Release);
                         atomics.deck_a_generation.fetch_add(1, Ordering::Relaxed);
                         atomics.deck_b_generation.fetch_add(1, Ordering::Relaxed);
                         atomics.preload_ready_rk.store(0, Ordering::Relaxed);
@@ -658,6 +687,12 @@ fn control_thread_main(
                         let _ = audio_cmd_tx.send(AudioCommand::DuckAndApply { duck_ms });
                     }
                     Command::Shutdown => {
+                        atomics
+                            .deck_a_stream_generation
+                            .fetch_add(1, Ordering::Release);
+                        atomics
+                            .deck_b_stream_generation
+                            .fetch_add(1, Ordering::Release);
                         atomics.deck_a_generation.fetch_add(1, Ordering::Relaxed);
                         atomics.deck_b_generation.fetch_add(1, Ordering::Relaxed);
                         info!("audio engine control thread shutting down");
@@ -725,6 +760,7 @@ fn handle_play(
     meta: &TrackMeta,
     deck: DeckId,
     generation: u64,
+    stream_generation: u64,
     audio_cmd_tx: &Sender<AudioCommand>,
     sample_tx: &Sender<SampleBatch>,
     event_tx: &Sender<EngineEvent>,
@@ -739,13 +775,14 @@ fn handle_play(
     cache_ramps(meta, audio_cmd_tx);
 
     let generation_signal = deck_generation(atomics, deck);
+    let stream_generation_signal = deck_stream_generation(atomics, deck);
     match fetch_and_decode_incremental(
         source,
         meta.rating_key,
         device_rate,
         device_channels,
-        generation_signal.clone(),
-        generation,
+        stream_generation_signal.clone(),
+        stream_generation,
     ) {
         Ok(result) => {
             if generation_signal.load(Ordering::Relaxed) != generation {
@@ -830,6 +867,8 @@ fn handle_play(
                     source_channels,
                     deck,
                     generation,
+                    stream_generation_signal,
+                    stream_generation,
                     sample_tx.clone(),
                     event_tx.clone(),
                     atomics.clone(),
@@ -863,6 +902,7 @@ fn handle_preload(
     meta: &TrackMeta,
     deck: DeckId,
     generation: u64,
+    stream_generation: u64,
     audio_cmd_tx: &Sender<AudioCommand>,
     sample_tx: &Sender<SampleBatch>,
     event_tx: &Sender<EngineEvent>,
@@ -876,13 +916,14 @@ fn handle_preload(
     cache_ramps(meta, audio_cmd_tx);
 
     let generation_signal = deck_generation(atomics, deck);
+    let stream_generation_signal = deck_stream_generation(atomics, deck);
     match fetch_and_decode_incremental(
         source,
         meta.rating_key,
         device_rate,
         device_channels,
-        generation_signal.clone(),
-        generation,
+        stream_generation_signal.clone(),
+        stream_generation,
     ) {
         Ok(result) => {
             if generation_signal.load(Ordering::Relaxed) != generation {
@@ -1002,6 +1043,8 @@ fn handle_preload(
                     source_channels,
                     deck,
                     generation,
+                    stream_generation_signal,
+                    stream_generation,
                     sample_tx.clone(),
                     event_tx.clone(),
                     atomics.clone(),
@@ -1058,6 +1101,8 @@ fn spawn_background_decode(
     source_channels: u16,
     deck: DeckId,
     generation: u64,
+    stream_generation_signal: Arc<AtomicU64>,
+    stream_generation: u64,
     sample_tx: Sender<SampleBatch>,
     event_tx: Sender<EngineEvent>,
     atomics: Arc<SharedAtomics>,
@@ -1082,11 +1127,32 @@ fn spawn_background_decode(
             let mut at_eof = false;
 
             loop {
-                // Check for seek request
-                let seek_ms = seek_signal.load(Ordering::Relaxed);
-                if seek_ms >= 0 {
-                    seek_signal.store(-1, Ordering::Relaxed);
-                    current_gen = gen_signal.load(Ordering::Acquire);
+                // A physical-deck replacement owns a different stream and
+                // retires this decoder. PCM generation changes with the same
+                // stream ownership on replacement, but also changes on seek;
+                // only the former is cancellation.
+                if stream_generation_signal.load(Ordering::Acquire) != stream_generation {
+                    debug!(rating_key, ?deck, stream_generation, "bg decode: superseded");
+                    return;
+                }
+
+                // Check for the newest seek epoch. The callback stores the
+                // requested position before publishing the generation with
+                // Release ordering, so observing the epoch makes the position
+                // visible as well. Keep the position in the mailbox rather
+                // than consuming it: if a newer epoch races this read, its
+                // position remains available on the next loop iteration.
+                let published_gen = gen_signal.load(Ordering::Acquire);
+                if published_gen != current_gen {
+                    if stream_generation_signal.load(Ordering::Acquire) != stream_generation {
+                        return;
+                    }
+                    let seek_ms = seek_signal.load(Ordering::Acquire);
+                    if seek_ms < 0 {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    current_gen = published_gen;
                     let seek_secs = seek_ms as f64 / 1000.0;
                     log::info!(
                         "native audio decoder seek started track={} deck={:?} position_seconds={seek_secs:.3}",
@@ -1124,15 +1190,17 @@ fn spawn_background_decode(
                                     Ok(resampler) => Some(resampler),
                                     Err(error) => {
                                         warn!(rating_key, %error, "could not reset resampler after seek");
-                                        report_decode_failure(
+                                        if report_decode_failure(
                                             &event_tx,
                                             &atomics,
                                             &gen_signal,
                                             current_gen,
                                             rating_key,
                                             format!("could not reset resampler after seek: {error}"),
-                                        );
-                                        return;
+                                        ) {
+                                            return;
+                                        }
+                                        continue;
                                     }
                                 };
                             }
@@ -1159,25 +1227,19 @@ fn spawn_background_decode(
                                 deck,
                                 e,
                             );
-                            report_decode_failure(
+                            if report_decode_failure(
                                 &event_tx,
                                 &atomics,
                                 &gen_signal,
                                 current_gen,
                                 rating_key,
                                 format!("audio seek failed: {e}"),
-                            );
-                            return;
+                            ) {
+                                return;
+                            }
+                            continue;
                         }
                     }
-                }
-
-                // Loading a different track into this physical deck advances
-                // its generation. Stop the superseded decoder instead of
-                // wasting I/O/CPU and filling the channel with stale batches.
-                if gen_signal.load(Ordering::Relaxed) != current_gen {
-                    debug!(rating_key, ?deck, current_gen, "bg decode: superseded");
-                    return;
                 }
 
                 // Keep the decoder alive after EOF so a later backward seek
@@ -1196,15 +1258,17 @@ fn spawn_background_decode(
                                 Ok(samples) => samples,
                                 Err(error) => {
                                     warn!(rating_key, %error, "background resampling failed");
-                                    report_decode_failure(
+                                    if report_decode_failure(
                                         &event_tx,
                                         &atomics,
                                         &gen_signal,
                                         current_gen,
                                         rating_key,
                                         format!("background resampling failed: {error}"),
-                                    );
-                                    return;
+                                    ) {
+                                        return;
+                                    }
+                                    continue;
                                 }
                             }
                         } else {
@@ -1238,14 +1302,17 @@ fn spawn_background_decode(
                             // as fully decoded so is_finished() won't fire and
                             // cause premature auto-advance.
                             warn!(rating_key, "bg decode: incomplete (stream truncated)");
-                            report_decode_failure(
+                            if report_decode_failure(
                                 &event_tx,
                                 &atomics,
                                 &gen_signal,
                                 current_gen,
                                 rating_key,
                                 "audio stream was truncated".into(),
-                            );
+                            ) {
+                                return;
+                            }
+                            continue;
                         } else {
                             debug!(rating_key, "bg decode: complete");
                             let mut samples = match resampler.as_mut() {
@@ -1253,15 +1320,17 @@ fn spawn_background_decode(
                                     Ok(samples) => samples,
                                     Err(error) => {
                                         warn!(rating_key, %error, "could not flush audio resampler");
-                                        report_decode_failure(
+                                        if report_decode_failure(
                                             &event_tx,
                                             &atomics,
                                             &gen_signal,
                                             current_gen,
                                             rating_key,
                                             format!("could not flush audio resampler: {error}"),
-                                        );
-                                        return;
+                                        ) {
+                                            return;
+                                        }
+                                        continue;
                                     }
                                 },
                                 None => Vec::new(),
@@ -1282,19 +1351,20 @@ fn spawn_background_decode(
                             at_eof = true;
                             continue;
                         }
-                        return;
                     }
                     Err(e) => {
                         warn!(rating_key, error = %e, "bg decode: error");
-                        report_decode_failure(
+                        if report_decode_failure(
                             &event_tx,
                             &atomics,
                             &gen_signal,
                             current_gen,
                             rating_key,
                             format!("background decode failed: {e}"),
-                        );
-                        return;
+                        ) {
+                            return;
+                        }
+                        continue;
                     }
                 }
             }
@@ -1302,6 +1372,10 @@ fn spawn_background_decode(
         .ok();
 }
 
+/// Reports a decode failure only when it still belongs to the current PCM
+/// generation. Returns `true` when the failure was current and the worker
+/// should stop; a `false` result means a newer seek superseded the failed work
+/// and the worker must continue with that seek.
 fn report_decode_failure(
     event_tx: &Sender<EngineEvent>,
     atomics: &SharedAtomics,
@@ -1309,9 +1383,9 @@ fn report_decode_failure(
     generation: u64,
     rating_key: i64,
     message: String,
-) {
+) -> bool {
     if generation_signal.load(Ordering::Acquire) != generation {
-        return;
+        return false;
     }
     atomics
         .preload_error_rk
@@ -1325,6 +1399,7 @@ fn report_decode_failure(
         }
     };
     let _ = event_tx.send(event);
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1351,8 +1426,8 @@ fn fetch_and_decode_incremental(
     rating_key: i64,
     device_rate: u32,
     device_channels: u16,
-    generation_signal: Arc<AtomicU64>,
-    generation: u64,
+    stream_generation_signal: Arc<AtomicU64>,
+    stream_generation: u64,
 ) -> Result<IncrementalDecodeResult, String> {
     use self::deck::streaming::{SharedBuffer, StreamingReader};
 
@@ -1369,7 +1444,7 @@ fn fetch_and_decode_incremental(
     std::thread::Builder::new()
         .name(format!("heya-audio-fetch-{rating_key}"))
         .spawn(move || {
-            if generation_signal.load(Ordering::Relaxed) != generation {
+            if stream_generation_signal.load(Ordering::Relaxed) != stream_generation {
                 let _ = response_ready_tx.send(Err("native audio load was cancelled"));
                 writer.abort();
                 return;
@@ -1432,7 +1507,7 @@ fn fetch_and_decode_incremental(
             let mut chunk = vec![0_u8; 128 * 1024];
             let mut received = 0_u64;
             loop {
-                if generation_signal.load(Ordering::Relaxed) != generation
+                if stream_generation_signal.load(Ordering::Relaxed) != stream_generation
                     || writer.is_abandoned()
                 {
                     writer.abort();
@@ -1650,6 +1725,33 @@ mod tests {
         assert!(!should_ignore_duplicate_preload(42, 42, 0, 42));
         assert!(!should_ignore_duplicate_preload(42, 7, 42, 42));
         assert!(!should_ignore_duplicate_preload(42, 7, 0, 43));
+    }
+
+    #[test]
+    fn seek_epochs_do_not_cancel_the_owned_stream() {
+        let atomics = SharedAtomics::new();
+        let first = next_deck_generations(&atomics, DeckId::A);
+
+        atomics.deck_a_generation.fetch_add(1, Ordering::AcqRel);
+
+        assert_eq!(
+            atomics.deck_a_stream_generation.load(Ordering::Acquire),
+            first.stream,
+            "seeking must retain the current HTTP stream"
+        );
+        assert_ne!(
+            atomics.deck_a_generation.load(Ordering::Acquire),
+            first.pcm,
+            "seeking must invalidate already-queued PCM"
+        );
+
+        let replacement = next_deck_generations(&atomics, DeckId::A);
+        assert_ne!(replacement.stream, first.stream);
+        assert_eq!(
+            atomics.deck_a_stream_generation.load(Ordering::Acquire),
+            replacement.stream,
+            "replacing the deck must cancel the old HTTP stream"
+        );
     }
 
     #[test]
