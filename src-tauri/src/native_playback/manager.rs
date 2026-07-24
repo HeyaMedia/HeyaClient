@@ -645,6 +645,12 @@ fn finish_session(
         state.loading = false;
         state.buffering = false;
         state.ended = reason == TerminationReason::Ended;
+        // The renderer worker returns right after this, dropping the engine and
+        // with it the embedded surface. Reporting the surface as still ready
+        // would leave the web layer transparent over nothing at all — on macOS
+        // that shows the desktop through the whole window (most visibly at the
+        // end of an episode, where the Up Next card is all that is left).
+        state.video_surface_ready = false;
         state.termination_reason = Some(reason);
         active.snapshot.state_revision = active.snapshot.state_revision.saturating_add(1);
         let event = (
@@ -939,6 +945,27 @@ mod tests {
             assert_eq!(event.payload.ended, expected_ended, "{reason:?}");
             assert_eq!(event.payload.termination_reason, Some(reason));
         }
+    }
+
+    #[test]
+    fn termination_reports_the_embedded_surface_as_gone() {
+        let (manager, _engine, sink, owner) = harness();
+        let session = manager
+            .start(PlaybackOwner::Web(owner), EngineMedia::Synthetic)
+            .unwrap()
+            .renderer_session_id;
+        publish_state(
+            &manager.shared,
+            &session,
+            NativePlaybackState {
+                video_surface_ready: true,
+                ..NativePlaybackState::default()
+            },
+        );
+        finish_session(&manager.shared, &session, TerminationReason::Ended);
+
+        let event = sink.state.lock().unwrap().last().unwrap().clone();
+        assert!(!event.payload.video_surface_ready);
     }
 
     #[test]

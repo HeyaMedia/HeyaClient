@@ -80,7 +80,11 @@ export interface NativePlaybackState {
   ended: boolean
   loading: boolean
   buffering: boolean
-  /** First video frame is visible on the selected native surface. */
+  /**
+   * First video frame is visible on the selected native surface. Returns to
+   * false with the terminal state event — the surface is torn down with the
+   * session, so a transparent WebView would expose the desktop behind it.
+   */
   videoSurfaceReady: boolean
   currentTime: number
   duration: number

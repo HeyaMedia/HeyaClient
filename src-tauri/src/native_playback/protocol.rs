@@ -309,7 +309,8 @@ pub struct NativePlaybackState {
     pub buffering: bool,
     /// Whether the selected native presentation surface has displayed video.
     /// For embedded rendering this changes only after the first real frame is
-    /// swapped, so the WebView can remain opaque during decoder startup.
+    /// swapped, so the WebView can remain opaque during decoder startup, and
+    /// returns to false when the session terminates and the surface goes away.
     pub video_surface_ready: bool,
     pub current_time: f64,
     pub duration: f64,
