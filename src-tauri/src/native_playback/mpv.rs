@@ -16,7 +16,7 @@ use std::{
     ffi::CString,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::AppHandle;
 
@@ -26,6 +26,64 @@ pub const NATIVE_MPV_FULLSCREEN_OFF_MENU_ID: &str = "native-mpv-fullscreen-off";
 #[cfg(debug_assertions)]
 const SYNTHETIC_VIDEO_SOURCE: &str = "av://lavfi:testsrc2=duration=30:size=1280x720:rate=30";
 const PLAYBACK_GRANT_HEADER_NAME: &str = "X-Heya-Playback-Grant";
+
+/// How many times a remote stream may be reloaded after MPV ends the file with
+/// an error before the failure is treated as real. With the backoff below this
+/// spans roughly two minutes — long enough for a Heya server restart, a
+/// container roll, or a Wi-Fi handover, and short enough that a genuinely
+/// broken source still reports failure while the user is still watching.
+const MAX_RESUME_ATTEMPTS: u32 = 8;
+
+/// Delay before the first reload. Doubles per attempt up to `MAX_RESUME_DELAY`.
+const BASE_RESUME_DELAY: Duration = Duration::from_secs(1);
+const MAX_RESUME_DELAY: Duration = Duration::from_secs(15);
+
+/// A remote source MPV can be pointed at again after a transient failure.
+///
+/// MPV reports a server that went away mid-stream exactly the way it reports a
+/// corrupt file: EndFile(Error). Heya's HLS endpoint rebuilds a dropped
+/// transcode session from the segment URL alone and keeps the segments it had
+/// already produced, so reloading the same URL at the same position is nearly
+/// always the correct response — and the one the user would otherwise have to
+/// perform by hand.
+struct ResumableSource {
+    url: String,
+    attempts: u32,
+    retry_at: Option<Instant>,
+}
+
+impl ResumableSource {
+    fn new(url: String) -> Self {
+        Self {
+            url,
+            attempts: 0,
+            retry_at: None,
+        }
+    }
+
+    /// Arm the next reload, or report that the budget is spent.
+    fn schedule(&mut self) -> bool {
+        if self.attempts >= MAX_RESUME_ATTEMPTS {
+            return false;
+        }
+        let delay = BASE_RESUME_DELAY
+            .saturating_mul(1u32 << self.attempts.min(4))
+            .min(MAX_RESUME_DELAY);
+        self.attempts += 1;
+        self.retry_at = Some(Instant::now() + delay);
+        true
+    }
+
+    fn due(&mut self) -> bool {
+        match self.retry_at {
+            Some(at) if Instant::now() >= at => {
+                self.retry_at = None;
+                true
+            }
+            _ => false,
+        }
+    }
+}
 
 pub struct MpvEngineFactory {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -118,6 +176,9 @@ struct MpvEngine {
     audio_track_map: HashMap<NormalizedTrackId, i64>,
     subtitle_track_map: HashMap<NormalizedTrackId, i64>,
     next_async_request_id: u64,
+    /// Present only for remote Heya media. Local development sources are never
+    /// reloaded: a missing file will still be missing a second later.
+    resume: Option<ResumableSource>,
 }
 
 enum PropertyData {
@@ -193,7 +254,7 @@ impl MpvEngine {
         // makes the platform-specific field order below authoritative even on
         // partial initialization: macOS drops its render context before mpv,
         // while Windows drops mpv before its parent HWND.
-        let engine = Self::initial(
+        let mut engine = Self::initial(
             mpv,
             video_surface,
             #[cfg(target_os = "macos")]
@@ -201,6 +262,7 @@ impl MpvEngine {
             #[cfg(target_os = "windows")]
             embedded_renderer,
         );
+        engine.resume = Some(ResumableSource::new(load.media_url().as_str().to_owned()));
         observe_properties(&engine.mpv)?;
 
         // The remote page can provide only the opaque grant value. The header
@@ -288,6 +350,7 @@ impl MpvEngine {
             audio_track_map: HashMap::new(),
             subtitle_track_map: HashMap::new(),
             next_async_request_id: 1,
+            resume: None,
         }
     }
 
@@ -627,6 +690,59 @@ impl MpvEngine {
             }
         }
     }
+
+    /// React to MPV ending a remote file with an error by arming a reload
+    /// instead of tearing the session down. Returns the state event that puts
+    /// the UI into a buffering-not-broken presentation, or None when the source
+    /// is local or the retry budget is spent — in which case the caller falls
+    /// through to the normal termination path.
+    fn begin_resume(&mut self) -> Option<EngineEvent> {
+        let position = self.state.current_time;
+        let resume = self.resume.as_mut()?;
+        if !resume.schedule() {
+            log::warn!(
+                "native playback gave up reconnecting after {} attempts",
+                resume.attempts
+            );
+            return None;
+        }
+        log::info!(
+            "native playback lost its source, reconnect attempt {} of {MAX_RESUME_ATTEMPTS} from {position:.1}s",
+            resume.attempts
+        );
+        // Deliberately not `ended`: the queue must not advance to the next item
+        // because the network blinked.
+        self.state.buffering = true;
+        self.state.loading = true;
+        self.state.playing = false;
+        self.state.ended = false;
+        Some(EngineEvent::State {
+            state: self.state.clone(),
+            kind: StateUpdateKind::Structural,
+        })
+    }
+
+    /// Re-issue the load once the backoff has elapsed. Runs from the poll loop
+    /// so the worker's own cadence provides the timing — nothing sleeps.
+    fn resume_if_due(&mut self) -> Option<EngineEvent> {
+        let position = self.state.current_time;
+        let resume = self.resume.as_mut()?;
+        if !resume.due() {
+            return None;
+        }
+        let url = resume.url.clone();
+        let attempts = resume.attempts;
+        if let Err(error) = load_source(&self.mpv, &url, Some(position)) {
+            log::warn!("native playback reconnect attempt {attempts} could not be issued: {error}");
+            // Arm the next attempt rather than failing here: the reason a
+            // loadfile is refused is usually the same outage we are riding out.
+            if self.resume.as_mut().is_some_and(ResumableSource::schedule) {
+                return None;
+            }
+            return Some(EngineEvent::Terminated(TerminationReason::Failed));
+        }
+        None
+    }
 }
 
 impl PlaybackEngine for MpvEngine {
@@ -701,6 +817,10 @@ impl PlaybackEngine for MpvEngine {
             return Ok(Some(event));
         }
 
+        if let Some(event) = self.resume_if_due() {
+            return Ok(Some(event));
+        }
+
         #[cfg(target_os = "macos")]
         if !self.state.video_surface_ready
             && self
@@ -722,6 +842,13 @@ impl PlaybackEngine for MpvEngine {
             Ok(Event::FileLoaded) => {
                 self.state.loading = false;
                 self.state.ended = false;
+                self.state.buffering = false;
+                // The source is back. Hand the next outage a full retry budget
+                // rather than one that a much earlier blip already spent.
+                if let Some(resume) = self.resume.as_mut() {
+                    resume.attempts = 0;
+                    resume.retry_at = None;
+                }
                 #[cfg(target_os = "macos")]
                 if self.video_surface == NativeVideoSurface::NativeWindow {
                     self.state.video_surface_ready = true;
@@ -768,6 +895,11 @@ impl PlaybackEngine for MpvEngine {
                 }))
             }
             Ok(Event::EndFile(reason)) => {
+                if reason == mpv_end_file_reason::Error {
+                    if let Some(event) = self.begin_resume() {
+                        return Ok(Some(event));
+                    }
+                }
                 Ok(normalize_end_reason(reason).map(EngineEvent::Terminated))
             }
             Ok(Event::Shutdown) => Ok(Some(EngineEvent::Terminated(
@@ -1088,11 +1220,58 @@ fn find_development_media() -> Option<PathBuf> {
 mod tests {
     use super::{
         bundled_vulkan_manifest, create_mpv, load_source, normalize_end_reason, MpvOutput,
-        SYNTHETIC_VIDEO_SOURCE,
+        ResumableSource, MAX_RESUME_ATTEMPTS, MAX_RESUME_DELAY, SYNTHETIC_VIDEO_SOURCE,
     };
     use crate::native_playback::TerminationReason;
     use libmpv2::mpv_end_file_reason;
     use std::path::Path;
+    use std::time::Instant;
+
+    #[test]
+    fn resume_backs_off_and_eventually_gives_up() {
+        let mut resume = ResumableSource::new("https://heya.example/hls/index.m3u8".into());
+        assert!(!resume.due(), "nothing is armed before a failure");
+
+        // Whole seconds: the deadline is derived from Instant::now(), so
+        // finer granularity would just measure clock jitter between the
+        // reference reading and the one schedule() takes internally.
+        let mut delays = Vec::new();
+        for attempt in 1..=MAX_RESUME_ATTEMPTS {
+            let before = Instant::now();
+            assert!(resume.schedule(), "attempt {attempt} should be granted");
+            delays.push(
+                resume
+                    .retry_at
+                    .expect("schedule arms a deadline")
+                    .saturating_duration_since(before)
+                    .as_secs(),
+            );
+        }
+        assert!(
+            !resume.schedule(),
+            "a genuinely dead source must stop being retried"
+        );
+
+        assert_eq!(
+            delays,
+            vec![1, 2, 4, 8, 15, 15, 15, 15],
+            "backoff must grow and then hold at the cap"
+        );
+        assert_eq!(MAX_RESUME_DELAY.as_secs(), 15);
+    }
+
+    #[test]
+    fn resume_fires_once_per_scheduled_attempt() {
+        let mut resume = ResumableSource::new("https://heya.example/hls/index.m3u8".into());
+        assert!(resume.schedule());
+        resume.retry_at = Some(Instant::now());
+
+        assert!(resume.due(), "an elapsed deadline fires");
+        assert!(
+            !resume.due(),
+            "a fired deadline must not re-fire — that would reload on every poll"
+        );
+    }
 
     #[test]
     fn maps_mpv_end_reasons_without_treating_close_as_completion() {
